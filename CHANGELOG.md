@@ -3,7 +3,32 @@
 Generated from the `REV` headers inside each source file (original headers were left untouched).
 Newest first. Details for each REV are still in that file's header.
 
-## 2026-10-04 — patch set P1-P3 (this delivery)
+## 2026-10-04 — post-P3 fixes (this session)
+- `market/indicators.py` REV 3.7.1 — LIQUIDITY SWEEP DOUBLE-DROP FIX
+  (`_liquidity_sweep` was dropping the in-progress bar a second time,
+  evaluating the 2nd-to-last closed bar; sweeps now fire on the latest
+  closed bar)
+- `web/app.py` REV 1.5.3 — TRADE-MANAGER LIFECYCLE FIX
+  (`bot_runner` finally-block now calls `request_stop()` before joining
+  the trade-manager thread; previously the join always timed out and
+  left the tm_thread alive across restarts, blocking the next Start
+  click with a 429 and — worse — allowing two managers on one account)
+- `web/app.py` REV 1.5.3 — removed dead module-level `stop_flag`
+- `core/config.py` REV 2.0.2 — SECURE DEFAULT HOST
+  (default was `0.0.0.0` — anyone on LAN could reach the dashboard;
+  now `127.0.0.1`, opt-in to expose via `HOST=0.0.0.0` in `.env`)
+- `core/client.py` REV 11.4 — HEDGE-MODE FAIL-FAST
+  (`set_client_keys` / `startup_checks` now RAISE on HEDGE mode instead
+  of logging and proceeding; previously the bot booted and every order
+  failed with -4061)
+- `future.py` REV 1.4.37 — DEAD `_cfg` CLEANUP
+  (removed unused `_cfg = _i.get_trading_config()` in `main_loop`;
+  saves one deepcopy of GLOBAL per startup)
+- `scripts/test_multi.py` REV 1.1 — PATH BOOTSTRAP + CLOSED-ONLY DATA
+  (script now works from any cwd; passes `df.iloc[:-1]` to indicators
+  to match production behaviour)
+
+## 2026-10-04 — patch set P1-P3 (previous delivery)
 - manage.py: orphan-position watch; manager-loop errors logged at WARNING
 - config_center.py: `max_fill_slippage_pct`, `orphan_watch_*` keys
 - entry/exit/manage/repair: 9 silent `except: pass` around exchange calls now log

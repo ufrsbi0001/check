@@ -1,21 +1,49 @@
 # Third-party packages actually imported by the bot (verified by AST scan).
-# Versions are intentionally unpinned: I do not know the versions your live
-# machine runs. On the machine where the bot works today, run
-#     pip freeze > requirements.lock.txt
-# and commit that file to get reproducible installs.
 #
-# python-binance must be a release that exposes the futures algo-order
-# methods used by core/client.py (_get_open_algo_orders / _cancel_algo_order);
-# otherwise those helpers silently return [] (see PATCH_NOTES.md, "Not done").
-python-binance
+# ── Why versions are not fully pinned ────────────────────────────────
+# The versions your bot works with on THIS machine are the correct ones.
+# Guessing them from here would risk breaking a working install. To get
+# a reproducible set:
+#
+#     pip freeze > requirements.lock.txt
+#
+# ...and commit BOTH this file (for humans / ranges) and the lock file
+# (for exact installs). To restore later:
+#
+#     pip install -r requirements.lock.txt
+# ─────────────────────────────────────────────────────────────────────
+#
+# ── python-binance version note ─────────────────────────────────────
+# core/client.py uses the futures algo-order methods
+# (futures_get_open_algo_orders / futures_cancel_algo_order) inside
+# _get_open_algo_orders / _cancel_algo_order. If the installed release
+# does not expose them, those helpers silently return [] and the bot
+# cannot cancel SL/TP orders attached to positions — which is unsafe
+# in production. Minimum known-good release: 1.0.19.
+# assert_sdk_methods() in core/client.py checks this at startup and
+# raises if the methods are missing, so a too-old install will fail
+# loudly at boot. The floor below is defensive; any 1.0.x you already
+# use that passes assert_sdk_methods() is fine.
+# ─────────────────────────────────────────────────────────────────────
+
+# ── Exchange ──
+python-binance>=1.0.19
+
+# ── Data ──
 pandas
 numpy
+
+# ── HTTP ──
 requests
 urllib3
 httpx
+
+# ── Web ──
 flask
 flask-cors
+
+# ── Config ──
 python-dotenv
 
-# development / tests
+# ── Development / tests (not required at runtime) ──
 pytest
