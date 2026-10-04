@@ -1,6 +1,27 @@
 """
 orders/manage.py — Trade management loop.
 
+REV 1.10.2 (2026-10-04) — ORPHAN-WATCH STARTUP GRACE:
+  ✅ CRITICAL: orphan-watch no longer fires during the startup window
+     between TM-thread launch and sync_existing_positions completion.
+     Root cause: web/app.py::bot_runner and future.py::__main__ both
+     start the TM thread BEFORE main_loop runs. main_loop's first
+     ~100 seconds are spent in validate_symbols (52-symbol
+     exchangeInfo check) and sync_existing_positions — during that
+     window bot_tracked_symbols is empty, so orphan-watch flagged
+     every real position as an orphan (6 false CRITICAL alerts in
+     the 17:39 log, cleared 50s later by sync).
+
+     Fix: a module-level _STARTUP_SYNC_DONE flag. orphan-watch
+     early-returns while it's False. Once sync_existing_positions()
+     completes, callers call mark_startup_sync_done() to arm the
+     watch. See the call site in future.py::main_loop (right after
+     `_o.sync_existing_positions()`).
+
+     Behavioral change: only during startup. Once armed, the watch
+     behaves exactly as before. Real orphans that appear AFTER
+     startup are still detected and alerted normally.
+
 REV 1.10.1 (2026-10-04) — FAST-RECONCILE + SESSION-LOCK FIXES:
   ✅ CRITICAL (C2): trade_manager_loop() now reconciles unverified /
      partial_fill trades on EVERY iteration. Previously all trades
@@ -71,6 +92,34 @@ from .exit import emergency_close_retry, handle_trade_close
 def _cc_get_num(key: str, default):
     v = _cc_get(key, None)
     return default if v is None else v
+
+
+# ═════════════════════════════════════════════════════════════
+#  REV 1.10.2 — ORPHAN-WATCH STARTUP GUARD
+#
+#  The TM thread is launched BEFORE main_loop() finishes its startup
+#  sequence (validate_symbols → sync_existing_positions). During that
+#  window bot_tracked_symbols is empty, so orphan-watch flagged every
+#  real position as an orphan.
+#
+#  Callers call mark_startup_sync_done() immediately AFTER
+#  sync_existing_positions() returns, arming the watch. Read/write
+#  of this bool is GIL-atomic, no lock needed.
+# ═════════════════════════════════════════════════════════════
+_STARTUP_SYNC_DONE = False
+
+
+def mark_startup_sync_done() -> None:
+    """
+    Arm orphan-watch. Call this AFTER the initial
+    sync_existing_positions() has completed and bot_tracked_symbols
+    reflects the real exchange state.
+
+    Idempotent — safe to call multiple times.
+    """
+    global _STARTUP_SYNC_DONE
+    _STARTUP_SYNC_DONE = True
+    logger.info("[orphan-watch] startup sync complete — watch armed")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -960,12 +1009,26 @@ def manage_single_trade(symbol):
 #  symbol in bot_tracked_symbols BEFORE sending the order, so a
 #  symbol that is untracked on two consecutive checks is a real
 #  orphan (or a position opened manually on the same account).
+#
+#  REV 1.10.2 — Gated by _STARTUP_SYNC_DONE. Before the initial
+#  sync_existing_positions() has populated bot_tracked_symbols,
+#  the watch is silent (otherwise it fires CRITICAL on every real
+#  position during the ~100s startup window).
 # ═════════════════════════════════════════════════════════════
 _ORPHAN_SEEN: dict = {}
 
 
 def _orphan_watch_tick(client=None):
     """Returns list of symbols confirmed as orphans on this tick."""
+
+    # ── REV 1.10.2 — startup grace ──
+    # Do NOT alert until sync_existing_positions() has completed.
+    # Before that, bot_tracked_symbols is empty and every real
+    # position looks like an orphan.
+    if not _STARTUP_SYNC_DONE:
+        _ORPHAN_SEEN.clear()
+        return []
+
     if not bool(_cc_get_num('orphan_watch_enabled', True)):
         _ORPHAN_SEEN.clear()
         return []

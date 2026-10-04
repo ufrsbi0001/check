@@ -1,6 +1,33 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.39 (2026-10-04) — ARM ORPHAN-WATCH ON DIRECT-CLI PATH:
+  ✅ `python future.py` (direct CLI) uses `_reconcile_on_startup()`
+     instead of `sync_existing_positions()`. The web-dashboard path
+     (main_loop) arms the orphan-watch via orders/repair.py REV 1.7.4,
+     but the CLI path bypassed it — so TM thread's orphan-watch stayed
+     silent until main_loop ran its own sync (~100s later).
+  ✅ Now `__main__` explicitly calls `mark_startup_sync_done()`
+     immediately after `_reconcile_on_startup()` finishes. The call
+     is idempotent, so the subsequent main_loop sync is harmless.
+  ✅ Zero change to the web path — `mark_startup_sync_done()` is
+     called once by repair.py and once here, whichever path runs
+     first wins. Second call just re-sets a bool to True.
+
+REV 1.4.38 (2026-10-04) — PATTERN COLUMN NOW SHOWS ACTUAL STRATEGY:
+  ✅ FIXED: The `pattern` field in scan_rows was hardcoded to
+     "TrendPullback" — a leftover from the earlier TREND_PULLBACK-only
+     design. It is now derived from the actual strategy that the
+     family router evaluated (or rejected with). Sources:
+       • "strat=NAME"  → signal fired, NAME produced it
+       • "NAME:reason" → NEUTRAL, NAME rejected it
+       • "—"           → nothing to show (no strategy touched it)
+     UI impact: the PATTERN column in the Market Scanner becomes
+     meaningful. It now matches the strategy in the ACTION column
+     for NEUTRAL rows (e.g. both show "RANGE_SCALPER"). For fired
+     signals it shows the exact strategy (e.g. "SUPERTREND_RIDE").
+     Zero change to any trading logic — display-only.
+
 REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP:
   ✅ Removed dead `_cfg = _i.get_trading_config()` at the top of
      main_loop(). The variable was never read anywhere in main_loop —
@@ -772,6 +799,47 @@ def _extract_strategy(reasons: list) -> str:
     return "UNKNOWN"
 
 
+# ═════════════════════════════════════════════════════════════
+#  REV 1.4.38 — DISPLAY-ONLY STRATEGY NAME EXTRACTION
+#  Used exclusively for the scan_rows "pattern" column and the
+#  local UI. Never feeds any trading logic.
+#
+#  Sources (in priority order):
+#    1. "strat=NAME"    — a signal fired; NAME produced it
+#    2. "NAME:reason"   — NEUTRAL; the router summary lists the
+#                         strategy that rejected the setup
+#    3. fallback        — "—" (no strategy touched this coin)
+#
+#  Why not reuse _extract_strategy()? It returns "UNKNOWN" for the
+#  NEUTRAL case (no strat= prefix), which would print "UNKNOWN" in
+#  every rejected row. This helper also parses the router's
+#  rejection summary so the PATTERN column matches the ACTION
+#  column (both showing e.g. "RANGE_SCALPER").
+# ═════════════════════════════════════════════════════════════
+def _extract_display_strategy(reasons: list, fallback: str = "—") -> str:
+    reasons = reasons or []
+
+    # 1. Signal fired — "strat=NAME"
+    for r in reasons:
+        if isinstance(r, str) and r.startswith("strat="):
+            return r.split("=", 1)[1].strip()
+
+    # 2. Router rejection summary — "NAME:reason"
+    #    Strategy names are ALL_CAPS_WITH_UNDERSCORES. The reason
+    #    suffix is lowercase or contains other punctuation. So the
+    #    first token before ":" must be uppercase and contain "_".
+    for r in reasons:
+        if not isinstance(r, str):
+            continue
+        if ":" not in r:
+            continue
+        head = r.split(":", 1)[0].strip()
+        if head and head.isupper() and "_" in head:
+            return head
+
+    return fallback
+
+
 def _spread_label() -> str:
     if not CC.get("use_spread_filter", True):
         return "OFF"
@@ -1194,7 +1262,8 @@ def main_loop():
                             'symbol': symbol,
                             'sig_1h': '-', 'sig_4h': '-', 'sig_1d': '-',
                             'conf': 0, 'price': live_price, 'rr': 0, 'adx': 0,
-                            'pattern': 'TrendPullback', 'regime': 'UNKNOWN',
+                            # REV 1.4.38 — "—" instead of "TrendPullback"
+                            'pattern': '—', 'regime': 'UNKNOWN',
                             'killzone': '-', 'family': _family,
                             'action': 'No Data'
                         })
@@ -1221,7 +1290,12 @@ def main_loop():
 
                     sig_4h = _display_tf_signal(ind_4h)
                     sig_1d = _display_tf_signal(ind_1d)
-                    pat_disp = "TrendPullback"
+
+                    # ── REV 1.4.38 — display the ACTUAL strategy. ──
+                    # Was hardcoded "TrendPullback" (legacy TREND_PULLBACK
+                    # design). Now shows the strategy that either fired
+                    # ("strat=NAME") or rejected ("NAME:reason").
+                    pat_disp = _extract_display_strategy(reasons)
 
                     cfg = _i.get_trading_config()
                     min_rr = cfg['min_rr']
@@ -1425,6 +1499,7 @@ def main_loop():
                         'conf': conf, 'price': live_price,
                         'rr': lvl.get('RR', 0),
                         'adx': ind_1h['adx'],
+                        # REV 1.4.38 — was hardcoded "TrendPullback"
                         'pattern': pat_disp,
                         'regime': _regime,
                         'killzone': _killzone,
@@ -1554,6 +1629,22 @@ if __name__ == "__main__":
     _s.load_active_trades()
     _s.clear_stop()
     _reconcile_on_startup()
+
+    # ── REV 1.4.39 — arm orphan-watch on the direct-CLI path. ──
+    # The web-dashboard path arms it inside
+    # orders/repair.py::sync_existing_positions (which main_loop
+    # calls below). This direct-CLI path uses _reconcile_on_startup
+    # instead, which does NOT call sync_existing_positions — so we
+    # must arm the watch explicitly here.
+    #
+    # Idempotent: if main_loop later runs its own sync, the call
+    # inside repair.py just re-sets the bool to True. No harm.
+    try:
+        from orders.manage import mark_startup_sync_done
+        mark_startup_sync_done()
+    except Exception as _msd_err:
+        logger.debug(f"mark_startup_sync_done (CLI): {_msd_err}")
+
     threading.Thread(target=_o.trade_manager_loop,
                      daemon=True, name="tm_engine").start()
 

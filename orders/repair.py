@@ -1,6 +1,20 @@
 """
 orders/repair.py — Reconciliation and order repair.
 
+REV 1.7.4 (2026-10-04) — ARM ORPHAN-WATCH AFTER STARTUP SYNC:
+  ✅ After the initial sync_existing_positions() completes and
+     bot_tracked_symbols reflects the exchange, call
+     orders.manage.mark_startup_sync_done(). This arms the orphan
+     watch that was previously firing false CRITICAL alerts during
+     the ~100s startup window (validate_symbols + first sync).
+     See orders/manage.py REV 1.10.2 for the corresponding guard.
+  ✅ Lazy import (inside the function) to avoid the module-load cycle:
+     manage.py imports from repair.py, so a top-level
+     `from .manage import ...` in repair.py would fail. By the time
+     this call runs, all modules are loaded — the import is safe.
+  ✅ If the import fails for any reason, we log a warning and continue.
+     The sync itself is still considered successful.
+
 REV 1.7.3 (2026-10-04) — ADOPTED SL FROM CONFIG (Point 4):
   ✅ _ADOPTED_FALLBACK_SL_PCT now read from
      config_center.GLOBAL["adopted_fallback_sl_pct"] (env-tunable via
@@ -1060,6 +1074,18 @@ def sync_existing_positions():
             f" sync complete — managed={found} adopted={adopted} "
             f"tracked={len(bot_tracked_symbols)}"
         )
+
+        # ── REV 1.7.4 — arm orphan-watch. ──
+        # Now that bot_tracked_symbols reflects the real exchange state,
+        # the orphan-watch may start alerting. Lazy import to avoid the
+        # module-load cycle (manage imports repair).
+        try:
+            from .manage import mark_startup_sync_done
+            mark_startup_sync_done()
+        except Exception as _msd_err:
+            logger.warning(
+                f"[sync] could not arm orphan-watch: {_msd_err}"
+            )
     except Exception as e:
         logger.error(f"Sync error: {e}")
 
