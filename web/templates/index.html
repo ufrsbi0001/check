@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <meta name="web-token" content="{{ web_token|default('') }}">
+  <meta name="format-detection" content="telephone=no">
+  <title>Trading Desk · Terminal Pro v13.4.0</title>
+  <meta name="description" content="Live futures trading terminal — positions, scanner, execution history and system logs.">
+  <meta name="theme-color" content="#08090d">
+  <meta name="color-scheme" content="dark">
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308090d'/%3E%3Cpath d='M9 21.5 14 14l4 4.5L23 9' stroke='%23d9b062' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="min-h-screen">
+
+<header class="header-blur">
+  <div class="header-inner">
+
+    <div class="header-brand">
+      <div class="brand-mark" aria-hidden="true"><span>◆</span></div>
+      <div class="brand-name">TRADING <b>DESK</b></div>
+    </div>
+
+    <div class="header-meta-scroll">
+      <div class="header-meta">
+        <div class="conn-pill" title="Live data connection health">
+          <span id="conn-dot" class="conn-dot" aria-hidden="true"></span>
+          <span id="conn-text" class="conn-text" aria-live="polite">LIVE</span>
+        </div>
+        <div id="status-badge" class="status-pill" role="status" aria-live="polite">
+          <span class="dot blink" style="background:var(--green)" aria-hidden="true"></span>
+          <span id="status-badge-text">STOPPED</span>
+        </div>
+        <div id="mode-chip" class="mode-chip" title="Trading environment" data-source="/api/config:trading_mode">--</div>
+        <div id="regime-chip" class="mono" title="Current market regime (dominant)">REGIME --</div>
+        <div id="killzone-chip" class="mono" title="Active trading session">KZ --</div>
+        <div id="clock-chip" class="clock-chip mono"><span aria-hidden="true">◷</span> <span id="header-clock">--:--:--</span></div>
+        <div id="partial-chip" class="chip chip-gold hidden mono"
+             title="Partial close profit threshold (from PARTIAL_CLOSE_USDT config)"
+             data-source="/api/config:partial_close_usdt">PARTIAL $0</div>
+        <div id="keys-badge" class="keys-tag">
+          <span aria-hidden="true">🔑</span><span id="keys-badge-text">KEYS —</span>
+        </div>
+        <div id="rate-limit-chip" class="chip chip-danger hidden mono">RATE LIMITED</div>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <div class="engine-toggle">
+        <button type="button" id="start-btn" class="btn btn-start" aria-label="Start trading engine">
+          <span id="start-btn-label">Start Engine</span>
+          <span id="start-spinner" class="hidden spinner" aria-hidden="true"></span>
+        </button>
+        <button type="button" id="stop-btn" class="btn btn-stop" aria-label="Stop trading engine">
+          <span id="stop-btn-label">Stop</span>
+          <span id="stop-spinner" class="hidden spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+
+  </div>
+</header>
+
+<main>
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-label"><span>Account Balance</span><span class="chip chip-mini">REAL+uPNL</span></div>
+      <div id="balance" class="stat-value">$0.00</div>
+      <div class="stat-sub"><span class="stat-sub-dot" style="background:var(--green)"></span> Wallet + uPnL</div>
+    </div>
+
+    <div class="stat" id="daily-loss-card">
+      <div class="stat-label"><span>Daily Drawdown</span></div>
+      <div id="daily-loss" class="stat-value">0 / 3</div>
+      <div class="risk-bar"><div id="risk-bar-fill" class="risk-bar-fill"></div></div>
+      <div class="stat-sub"><span class="stat-sub-dot" style="background:var(--red)"></span> Max loss limit
+        <span class="chip chip-mini" title="Daily loss cap now correctly counts SL hits (REV 1.3.9 fix)">v1.3.9</span>
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="stat-label"><span>Active Positions</span></div>
+      <div id="positions" class="stat-value">0</div>
+      <div class="stat-sub"><span id="uptime" class="mono">00:00:00</span><span class="stat-sub-dot"></span> uptime</div>
+    </div>
+
+    <div class="stat">
+      <div class="stat-label"><span>Win / Loss</span></div>
+      <div id="winrate" class="stat-value">0.0%</div>
+      <div class="ratio-bar"><div id="ratio-bar-fill" class="ratio-bar-fill"></div></div>
+      <div class="stat-sub"><span id="wins" class="pnl-pos">0</span>W<span class="stat-sub-dot"></span><span id="losses" class="pnl-neg">0</span>L</div>
+    </div>
+
+    <div class="stat stat-accent stat-hoverable" id="net-pnl-card" tabindex="0" role="button" aria-haspopup="true" aria-expanded="false" aria-controls="net-pnl-popover" aria-label="Net PnL breakdown, activate to view fee details">
+      <div class="stat-label"><span>Net PnL</span><span class="chip chip-mini">after fees</span></div>
+      <div id="net-pnl" class="stat-value">$0.00</div>
+      <div id="net-pnl-sub" class="stat-sub">Realized − commission − funding</div>
+      <canvas id="pnl-spark" width="240" height="30" aria-hidden="true"></canvas>
+      <div class="stat-popover" id="net-pnl-popover" role="region" aria-label="Net PnL breakdown">
+        <div class="popover-row"><span>Gross PnL</span><span id="total-pnl" class="mono">$0.00</span></div>
+        <div class="popover-row">
+          <span id="total-trades">0 trades • verified</span>
+          <span id="verify-badge" class="hidden" title="Backend total_records_fetched sanity check"></span>
+        </div>
+        <div class="popover-row"><span>Fees Paid</span><span id="total-fees" class="mono">$0.00</span></div>
+        <div class="popover-row"><span id="fees-breakdown">comm $0.00 • fund $0.00</span></div>
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="stat-label"><span>Sync Health</span></div>
+      <div id="last-update" class="stat-value" style="font-size:15px">--</div>
+      <div id="scan-time" class="stat-sub mono">--</div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       TIME EXIT CONTROL (REV 1.4.1)
+       Toggle TIME_EXIT on/off at runtime via /api/time_exit
+       ════════════════════════════════════════════════════════════ -->
+  <div class="te-control-card" id="te-control">
+    <div class="te-title">
+      <span class="te-dot" aria-hidden="true"></span>
+      <span>TIME EXIT CONTROL</span>
+    </div>
+
+    <span id="te-badge" class="te-badge te-off" aria-live="polite">OFF</span>
+
+    <label class="te-switch" for="te-toggle" title="Enable or disable time-based exits">
+      <input type="checkbox" id="te-toggle" role="switch" aria-label="Toggle TIME_EXIT">
+      <span class="te-track" aria-hidden="true"></span>
+      <span id="te-toggle-label">TIME_EXIT</span>
+    </label>
+
+    <label class="te-field" for="te-hold-minutes">
+      Hold min
+      <input type="number" id="te-hold-minutes" min="0" step="5" value="180"
+             aria-label="Hold minutes before time exit">
+    </label>
+
+    <button type="button" class="te-save" id="te-save-btn">Save</button>
+
+    <span class="te-status" id="te-status" aria-live="polite"></span>
+  </div>
+
+  <div class="tab-bar-row">
+    <div class="tabs-wrap" role="tablist" aria-label="Terminal panels">
+      <button type="button" data-tab="live" id="tabbtn-live" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-live">Live<span id="live-count-tab" class="tab-count">0</span></button>
+      <button type="button" data-tab="scanner" id="tabbtn-scanner" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-scanner">Scanner</button>
+      <button type="button" data-tab="history" id="tabbtn-history" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-history">History<span id="history-count" class="tab-count">0</span></button>
+      <button type="button" data-tab="fills" id="tabbtn-fills" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-fills">Fills<span id="fills-count-tab" class="tab-count">0</span></button>
+      <button type="button" data-tab="logs" id="tabbtn-logs" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-logs">Logs</button>
+    </div>
+    <div class="tab-bar-note">
+      <span id="tab-clock" class="mono">--:--:--</span>
+      <span style="opacity:.4;margin:0 6px">·</span>
+      <span class="kbd">1</span>–<span class="kbd">5</span> tabs
+      <span style="opacity:.4;margin:0 6px">·</span>
+      <span class="kbd">R</span> refresh
+    </div>
+  </div>
+
+  <div id="tab-live" class="tab-panel panel" role="tabpanel" aria-labelledby="tabbtn-live" tabindex="0">
+    <div class="panel-head">
+      <div class="panel-title">
+        <i style="background:var(--green)" aria-hidden="true"></i>
+        Active Positions · futures_position_information()
+        <span id="live-sync" class="panel-sync"></span>
+      </div>
+      <div class="panel-tools">
+        <div class="search-wrap">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="live-filter" class="search-input" placeholder="Filter symbol..." aria-label="Filter live positions by symbol">
+        </div>
+        <button type="button" class="icon-btn" id="live-refresh" title="Refresh now" aria-label="Refresh live positions">↻</button>
+        <div class="chip chip-static mono" title="SL level tag from orders.py (INITIAL / BE / LOCK1 / LOCK2)">SL LEVELS</div>
+        <div class="chip chip-static">LIVE /api/status</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table-pro" id="live-table">
+        <colgroup>
+          <col style="width:9%"><col style="width:7%"><col style="width:12%"><col style="width:12%">
+          <col style="width:9%"><col style="width:20%"><col style="width:15%"><col style="width:8%">
+          <col style="width:8%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th><div class="th-inner left">Symbol</div></th>
+            <th><div class="th-inner center">Side</div></th>
+            <th><div class="th-inner right">Entry Price</div></th>
+            <th><div class="th-inner right">Mark Price</div></th>
+            <th><div class="th-inner right">Qty</div></th>
+            <th><div class="th-inner right">Unrealized PnL</div></th>
+            <th><div class="th-inner center" title="R-scaled SL level: INITIAL / BE / LOCK1 / LOCK2">Stop Loss</div></th>
+            <th><div class="th-inner center" title="BOT = bot-managed; MANUAL = external position">Source</div></th>
+            <th><div class="th-inner center th-close-col" title="Manually close this position at market">Actions</div></th>
+          </tr>
+        </thead>
+        <tbody id="trades-body">
+          <tr class="empty-row">
+            <td colspan="9">
+              <div class="empty-state">
+                <div class="empty-state-title">No positions open</div>
+                <div class="empty-state-sub">Market scanner is checking for setups. Best opportunities come during London (12:00 PKT) and NY (17:00 PKT) sessions.</div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-scanner" class="tab-panel panel hidden" role="tabpanel" aria-labelledby="tabbtn-scanner" tabindex="0">
+    <div class="panel-head">
+      <div class="panel-title">
+        <i style="background:var(--gold)" aria-hidden="true"></i>
+        Market Scanner · SCAN_RESULTS
+        <span id="scan-sync" class="panel-sync"></span>
+      </div>
+      <div class="panel-tools">
+        <div class="search-wrap">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="scan-filter" class="search-input" placeholder="Filter symbol..." aria-label="Filter scanner results by symbol">
+        </div>
+        <button type="button" class="icon-btn" id="scan-refresh" title="Refresh now" aria-label="Refresh scanner">↻</button>
+        <div class="chip mono" id="scan-time-full">--</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table-pro">
+        <colgroup>
+          <col style="width:5%"><col style="width:7%"><col style="width:7%"><col style="width:7%">
+          <col style="width:7%"><col style="width:8%"><col style="width:4%"><col style="width:5%">
+          <col style="width:9%"><col style="width:9%"><col style="width:9%"><col style="width:7%">
+          <col style="width:16%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th><div class="th-inner left">Asset</div></th>
+            <th><div class="th-inner center">Signal 1H</div></th>
+            <th><div class="th-inner center">Signal 4H</div></th>
+            <th><div class="th-inner center">Signal 1D</div></th>
+            <th><div class="th-inner right">Conf</div></th>
+            <th><div class="th-inner right">Price</div></th>
+            <th><div class="th-inner right">RR</div></th>
+            <th><div class="th-inner right">ADX</div></th>
+            <th><div class="th-inner left">Pattern</div></th>
+            <th><div class="th-inner center" title="Family module used by family_router">Family</div></th>
+            <th><div class="th-inner center">Regime</div></th>
+            <th><div class="th-inner center">Killzone</div></th>
+            <th><div class="th-inner left">Action</div></th>
+          </tr>
+        </thead>
+        <tbody id="scan-body">
+          <tr class="empty-row">
+            <td colspan="13">
+              <div class="empty-state">
+                <div class="empty-state-title">Scanning markets...</div>
+                <div class="empty-state-sub">Bot scan cycle runs every ~20 seconds.</div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-history" class="tab-panel panel hidden" role="tabpanel" aria-labelledby="tabbtn-history" tabindex="0">
+    <div class="panel-head">
+      <div class="panel-title">
+        <i style="background:var(--gold)" aria-hidden="true"></i>
+        Trade History · futures_income_history()
+        <span id="history-verify-text"></span>
+        <span id="history-sync" class="panel-sync"></span>
+      </div>
+      <div class="panel-tools">
+        <div class="search-wrap">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="history-filter" class="search-input" placeholder="Filter symbol..." aria-label="Filter trade history by symbol">
+        </div>
+        <button type="button" class="icon-btn" id="history-refresh" title="Refresh now" aria-label="Refresh trade history">↻</button>
+        <div id="history-calc-info" class="chip hidden"></div>
+        <div id="history-lookback-chip" class="chip mono"
+             title="History window from HISTORY_LOOKBACK_DAYS config"
+             data-source="/api/history:lookback_days">30d window</div>
+        <div id="history-records-chip" class="chip mono hidden"
+             title="Total raw income records fetched (sanity check)"
+             data-source="/api/history:total_records_fetched">0 records</div>
+        <div class="chip mono" id="history-total-pnl-chip">$0.00</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table-pro">
+        <colgroup>
+          <col style="width:17%"><col style="width:9%"><col style="width:9%"><col style="width:12%">
+          <col style="width:11%"><col style="width:12%"><col style="width:10%"><col style="width:20%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th><div class="th-inner left">Date / Time</div></th>
+            <th><div class="th-inner left">Symbol</div></th>
+            <th><div class="th-inner center" title="WIN if pnl &gt; 0, LOSS if pnl &lt; 0, BE otherwise">Result</div></th>
+            <th><div class="th-inner right">Realized PnL</div></th>
+            <th><div class="th-inner right">Commission</div></th>
+            <th><div class="th-inner right" title="Realized PnL + commission + funding">Net PnL</div></th>
+            <th><div class="th-inner center">Status</div></th>
+            <th><div class="th-inner right">Running Total</div></th>
+          </tr>
+        </thead>
+        <tbody id="pnl-body">
+          <tr class="empty-row">
+            <td colspan="8">
+              <div class="empty-state">
+                <div class="empty-state-title">No closed trades yet</div>
+                <div class="empty-state-sub">History will populate after the first trade closes.</div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+        <tfoot id="pnl-foot" class="hidden table-foot">
+          <tr>
+            <td colspan="3" class="footer-note">TOTALS VERIFIED LOCALLY</td>
+            <td id="foot-pnl" class="mono" style="text-align:right;font-weight:700">--</td>
+            <td id="foot-comm" class="mono" style="text-align:right">--</td>
+            <td id="foot-net" class="mono" style="text-align:right;font-weight:700">--</td>
+            <td id="foot-count" class="mono" style="text-align:center">--</td>
+            <td class="footer-sigma">Σ = SUM(PnL)</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-fills" class="tab-panel panel hidden" role="tabpanel" aria-labelledby="tabbtn-fills" tabindex="0">
+    <div class="panel-head">
+      <div class="panel-title">
+        <i style="background:var(--blue)" aria-hidden="true"></i>
+        Execution Fills · futures_account_trades()
+        <span id="fills-sync" class="panel-sync"></span>
+      </div>
+      <div class="panel-tools">
+        <div class="search-wrap">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="fills-filter" class="search-input" placeholder="Filter symbol..." aria-label="Filter execution fills by symbol">
+        </div>
+        <button type="button" class="icon-btn" id="fills-refresh" title="Refresh now" aria-label="Refresh execution fills">↻</button>
+        <div id="fills-grouped-info" class="chip mono hidden"
+             title="Fills at the same second are grouped — Trade ID column shows ×N when grouped"
+             data-source="/api/history/detailed:trades[].count">0 grouped</div>
+        <div class="chip mono" id="fills-total-count">0 fills</div>
+        <div class="chip mono" id="fills-total-pnl">$0.00</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table-pro">
+        <colgroup>
+          <col style="width:17%"><col style="width:9%"><col style="width:8%"><col style="width:12%">
+          <col style="width:10%"><col style="width:13%"><col style="width:11%"><col style="width:20%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th><div class="th-inner left">Time</div></th>
+            <th><div class="th-inner left">Symbol</div></th>
+            <th><div class="th-inner center">Side</div></th>
+            <th><div class="th-inner right">Price</div></th>
+            <th><div class="th-inner right">Qty</div></th>
+            <th><div class="th-inner right">Realized PnL</div></th>
+            <th><div class="th-inner right">Commission</div></th>
+            <th><div class="th-inner right" title="Trade ID · ×N when N same-second fills were grouped">Trade ID</div></th>
+          </tr>
+        </thead>
+        <tbody id="fills-body">
+          <tr class="empty-row">
+            <td colspan="8">
+              <div class="empty-state">
+                <div class="empty-state-title">Loading fills...</div>
+                <div class="empty-state-sub">Execution history pulls from Binance Futures API.</div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-logs" class="tab-panel panel hidden" role="tabpanel" aria-labelledby="tabbtn-logs" tabindex="0">
+    <div class="panel-head">
+      <div class="panel-title"><i style="background:var(--blue)" aria-hidden="true"></i> System Logs · logs_deque</div>
+      <button type="button" id="clear-logs" class="btn-ghost">Clear View</button>
+    </div>
+    <div class="console-toolbar">
+      <div class="console-filters" role="group" aria-label="Filter logs by level">
+        <button type="button" class="btn-ghost log-filter-btn active" data-level="ALL" aria-pressed="true">ALL</button>
+        <button type="button" class="btn-ghost log-filter-btn" data-level="INFO" aria-pressed="false">INFO</button>
+        <button type="button" class="btn-ghost log-filter-btn" data-level="WARN" aria-pressed="false">WARN</button>
+        <button type="button" class="btn-ghost log-filter-btn" data-level="ERROR" aria-pressed="false">ERROR</button>
+      </div>
+      <label class="autoscroll-wrap">
+        <span class="switch">
+          <input type="checkbox" id="autoscroll-toggle" checked>
+          <span class="switch-track" aria-hidden="true"></span>
+        </span>
+        AUTO-SCROLL
+      </label>
+    </div>
+    <div id="log-container" class="log-box" role="log" aria-relevant="additions"></div>
+  </div>
+</main>
+
+<div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
+
+<div id="confirm-modal" class="modal-overlay" role="dialog" aria-modal="true"
+     aria-labelledby="confirm-title" aria-describedby="confirm-message"
+     aria-hidden="true">
+  <div class="modal-card">
+    <div id="confirm-title" class="modal-title">Confirm Action</div>
+    <div id="confirm-message" class="modal-message">Are you sure you want to proceed?</div>
+    <div class="modal-actions">
+      <button type="button" id="confirm-cancel" class="btn-ghost">Cancel</button>
+      <button type="button" id="confirm-ok" class="btn btn-start">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<noscript>
+  <div style="padding:20px;text-align:center;color:#d9b062;font-family:monospace;background:#08090d;border-top:1px solid #2a2d38">
+    JavaScript is required to run this terminal.
+  </div>
+</noscript>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/ui-polish-addon.js') }}"></script>
+</body>
+</html>

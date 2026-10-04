@@ -1,0 +1,48 @@
+# ─── Secrets ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Data files ────────────────────────────────────
+data/
+Logs/
+*.log
+bot.log
+trading_log.csv
+trades_exit.csv
+active_trades.json
+cooldowns.json
+daily_tracker.json
+coin_rotation.json
+pause.txt
+unmanaged_positions.json
+
+# ─── Python ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# ─── IDE ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Temporary test scripts ────────────────────────
+verify_dead_code.py
+verify_final.py
+test_phase2.py
+test_phase3.py
+
+# ─── Scripts output (diagnostic) ───────────────────
+scripts/*.json
