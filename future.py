@@ -1,6 +1,14 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP:
+  ✅ Removed dead `_cfg = _i.get_trading_config()` at the top of
+     main_loop(). The variable was never read anywhere in main_loop —
+     the loop body uses its own `cfg = _i.get_trading_config()` for
+     the per-coin RR floor. So the top-level assignment was pure
+     dead code (an extra deepcopy of GLOBAL per startup for nothing).
+     Zero functional change.
+
 REV 1.4.36 (2026-10-04) — LOG BANNER SYNC TO 9-FILTER ENGINE:
   ✅ Startup banner now logs "9-filter vote, N/9 required" instead of
      "6-filter vote, N/6 required". The engine has been 9 filters
@@ -887,7 +895,9 @@ def main_loop():
         logger.error("No valid symbols.")
         return
 
-    _cfg = _i.get_trading_config()
+    # ── REV 1.4.37 — dead `_cfg = _i.get_trading_config()` removed. ──
+    # It was assigned here but never read; the per-coin loop body
+    # reads its own `cfg = _i.get_trading_config()` for the RR floor.
     _be_lock_str = _format_be_lock_config()
 
     logger.info(f"PRO TRADING v13.3.22 - {TRADING_MODE} | Risk {RISK_PERCENT}% | "

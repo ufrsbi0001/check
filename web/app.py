@@ -1,6 +1,20 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
+REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX:
+  ✅ CRITICAL: bot_runner() finally-block now calls request_stop()
+     BEFORE joining the trade_manager thread. Previously the
+     tm_thread was joined with a 15s timeout but never signalled to
+     stop — so it ALWAYS timed out, stayed alive, and blocked the
+     next Start click with "Trade manager still shutting down" (429).
+     Worse: without the stop signal, the tm_thread could survive into
+     the next bot_runner() launch, running TWO trade managers on the
+     same account. The fix signals stop first, THEN joins.
+  ✅ REMOVED dead module-level `stop_flag` (was set in api_start /
+     api_stop but never read anywhere). Zero behaviour change for
+     callers since the true stop signal is `core.state.request_stop()`
+     → `_stop_event.set()`, which is unchanged.
+
 REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS:
   ✅ REMOVED @rate_limit(1) from /api/status and /api/scan. The
      dashboard polls these read-only endpoints at >1 req/sec, and
@@ -222,8 +236,12 @@ logs_deque.append(f"[{datetime.now().strftime('%H:%M:%S')}] {LOG_PREFIX_IDLE}")
 
 bot_thread: Optional[threading.Thread] = None
 tm_thread: Optional[threading.Thread] = None
-stop_flag = False
 start_time: Optional[float] = None
+
+# REV 1.5.3 — module-level `stop_flag` REMOVED.
+# The authoritative stop signal is core.state.request_stop() →
+# _stop_event.set(), which bot_runner now calls explicitly. The old
+# flag was written in api_start / api_stop but never read anywhere.
 
 
 def add_log(msg: str) -> None:
@@ -338,8 +356,23 @@ def api_error(message: str, status: int = 500) -> tuple[Response, int]:
 # BOT RUNNER
 # ─────────────────────────────────────────────────────────────
 def bot_runner() -> None:
-    """Run the trading engine main loop in a background thread."""
-    global stop_flag, start_time, tm_thread
+    """
+    Run the trading engine main loop in a background thread.
+
+    REV 1.5.3 — CRITICAL LIFECYCLE FIX:
+      The finally-block now calls request_stop() BEFORE joining the
+      trade-manager thread. Previously the join(15) always timed out
+      because nothing told the tm_thread to exit — which left it
+      alive across bot restarts, blocking the next Start click with
+      "Trade manager still shutting down" (429) and, in bad
+      scenarios, running TWO managers on the same account.
+
+      Order matters:
+        1. bot_state["running"] = False  (UI reflects stop immediately)
+        2. request_stop()                (signal main_loop AND tm_loop)
+        3. join tm_thread with timeout   (now it can actually exit)
+    """
+    global start_time, tm_thread
     start_time = time.time()
 
     if not TT_AVAILABLE:
@@ -371,6 +404,18 @@ def bot_runner() -> None:
         with state_lock:
             bot_state["running"] = False
         add_log("⏹️ Bot stopped.")
+
+        # ── REV 1.5.3 — CRITICAL: signal ALL engine threads to stop ──
+        # Without this, trade_manager_loop keeps spinning (it only
+        # exits on is_stopped() == True), and the join() below times
+        # out — leaving the tm_thread alive into the next run.
+        try:
+            _stop_fn = _engine_attr("request_stop", "core.state")
+            if callable(_stop_fn):
+                _stop_fn()
+                log.debug("[bot_runner] request_stop() signalled")
+        except Exception as _se:
+            log.warning(f"[bot_runner] request_stop failed: {_safe_err(_se)}")
 
         if tm_thread is not None and tm_thread.is_alive():
             tm_thread.join(timeout=15)
@@ -604,7 +649,7 @@ def api_scan() -> Response:
 @token_required
 @rate_limit(3)
 def api_start() -> Any:
-    global bot_thread, tm_thread, stop_flag
+    global bot_thread, tm_thread
 
     with state_lock:
         if bot_state["running"]:
@@ -657,7 +702,9 @@ def api_start() -> Any:
             bot_state["keys_set"] = True
 
         add_log("✅ API keys validated. Initializing engine...")
-        stop_flag = False
+        # REV 1.5.3 — dead stop_flag removed. The engine thread is
+        # started here; the actual stop signal is request_stop() from
+        # bot_runner's finally-block / api_stop.
         bot_thread = threading.Thread(
             target=bot_runner, daemon=True, name="bot_runner"
         )
@@ -680,8 +727,6 @@ def api_start() -> Any:
 @token_required
 @rate_limit(2)
 def api_stop() -> Any:
-    global stop_flag
-
     with state_lock:
         if not bot_state["running"]:
             return api_error("Not running", 400)
@@ -701,7 +746,7 @@ def api_stop() -> Any:
             except Exception as exc:
                 log.warning("request_stop() raised: %s", _safe_err(exc))
 
-    stop_flag = True
+    # REV 1.5.3 — dead stop_flag removed.
     add_log("⏹️ Stopping bot...")
 
     try:

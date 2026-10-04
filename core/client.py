@@ -4,6 +4,21 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
+REV 11.4 (2026-10-04) — HEDGE-MODE FAIL-FAST:
+  ✅ CRITICAL: set_client_keys() and startup_checks() now RAISE a
+     RuntimeError when the account is in HEDGE mode
+     (dualSidePosition=True). Previously check_position_mode() only
+     LOGGED a CRITICAL and returned the bool — which both callers
+     ignored. The bot booted successfully into HEDGE mode, then every
+     order failed at the exchange with cryptic codes (-4061 / -4046 /
+     "reduceOnly rejected"), wasting time and creating confusion.
+     Now the failure is immediate and actionable, at the exact point
+     where the mode is discovered.
+  ✅ check_position_mode() contract unchanged: returns True (HEDGE),
+     False (ONE-WAY), or None (check itself failed — e.g. API error).
+     Callers decide what to do with None; only True is a hard fail.
+  ✅ Zero behaviour change for ONE-WAY accounts (the common case).
+
 REV 11.3 (2026-10-04) — CRITICAL-PATH TIMEOUT ISOLATION (A1):
   ✅ CRITICAL (A1): _run_with_timeout() no longer caps ORDER-PLACEMENT
      calls at 6s. Order placement (market:, sl:, tp1:, tp2:,
@@ -1063,6 +1078,22 @@ def _cancel_algo_order(pair: str, algo_id) -> bool:
 # CLIENT SETUP
 # ─────────────────────────────────────────────────────────────
 def check_position_mode() -> Optional[bool]:
+    """
+    Query the account's position mode.
+
+    Returns:
+      True  → HEDGE MODE (dualSidePosition=True). Callers MUST fail.
+      False → ONE-WAY mode. Safe to trade.
+      None  → the check itself failed (network / API error). Not a
+              HEDGE verdict — do NOT treat as a hard fail; the caller
+              can log and proceed, since a transient API hiccup should
+              not block startup. Binance will reject orders with a
+              specific error if the mode is actually HEDGE and we
+              missed it here.
+
+    REV 11.4 — same return contract, but set_client_keys() and
+    startup_checks() now RAISE on True instead of ignoring the value.
+    """
     if _global_client is None:
         return None
     try:
@@ -1083,6 +1114,15 @@ def check_position_mode() -> Optional[bool]:
 
 
 def set_client_keys(api_key: str, api_secret: str) -> Client:
+    """
+    Initialise the Binance client with the given credentials.
+
+    REV 11.4 — HEDGE mode is now a HARD FAIL. Previously the mode
+    check ran but its result was discarded, so the bot would boot
+    into HEDGE mode and every subsequent order failed with cryptic
+    codes. Now a HEDGE account raises RuntimeError immediately with
+    a clear, actionable message.
+    """
     global _global_client
     api_key = _clean_key(api_key)
     api_secret = _clean_key(api_secret)
@@ -1113,7 +1153,22 @@ def set_client_keys(api_key: str, api_secret: str) -> Client:
     except Exception as e:
         logger.critical(f"SDK assertion failed: {e}")
         raise
-    check_position_mode()
+
+    # ── REV 11.4 — HEDGE mode is a hard fail ──
+    # check_position_mode() returns:
+    #   True  → HEDGE, we MUST abort
+    #   False → ONE-WAY, proceed
+    #   None  → transient check failure; log & proceed (Binance will
+    #           reject orders with -4061 if HEDGE is actually active,
+    #           and the caller will see that error directly).
+    _dual = check_position_mode()
+    if _dual is True:
+        raise RuntimeError(
+            "Account is in HEDGE mode (dualSidePosition=True). "
+            "All orders will fail with -4061. Switch the account to "
+            "ONE-WAY mode in Binance UI before starting the bot."
+        )
+
     if not CONFIG.telegram_enabled or not CONFIG.telegram_bot_token:
         logger.warning(
             "⚠️ Telegram disabled or token empty — CRITICAL alerts will "
@@ -1151,10 +1206,24 @@ def _validate_api_credentials(client: Client) -> tuple[bool, float]:
 
 
 def startup_checks() -> None:
+    """
+    Startup sanity checks. Called by future.py during CLI bootstrap.
+
+    REV 11.4 — HEDGE mode is a HARD FAIL here too, matching
+    set_client_keys(). Same rationale: never let the bot run with
+    a position mode that makes every order fail at the exchange.
+    """
     if _global_client is None:
         raise RuntimeError("startup_checks: client not initialised")
     assert_sdk_methods()
-    check_position_mode()
+
+    _dual = check_position_mode()
+    if _dual is True:
+        raise RuntimeError(
+            "Account is in HEDGE mode (dualSidePosition=True). "
+            "Switch to ONE-WAY mode before starting the bot."
+        )
+
     if not CONFIG.telegram_enabled or not CONFIG.telegram_bot_token:
         logger.warning(
             "⚠️ Telegram alerts disabled — CRITICAL events will be silent."

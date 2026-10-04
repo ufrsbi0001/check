@@ -1,7 +1,19 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
-REV 3.7 (2026-10-04) — LIQUIDITY SWEEP + FVG ZONES (NEW):
+REV 3.7.1 (2026-10-04) — LIQUIDITY SWEEP DOUBLE-DROP FIX:
+  ✅ CRITICAL: _liquidity_sweep() no longer drops the in-progress bar
+     itself. The caller (future.py::_fetch_coin_indicators and
+     calculate_pro_indicators' callers) ALREADY passes closed-only
+     data (`df.iloc[:-1]`). The internal `.iloc[:-1]` was therefore a
+     SECOND drop, causing sweep detection to evaluate the
+     second-to-last closed bar instead of the most recent closed bar.
+     Net effect: sweeps were detected one bar late — reducing the
+     value of the sweep_bull/sweep_bear vote in decision_engine.
+     Fix: use `df.iloc[-1]` as curr, `df.iloc[-(lookback+1):-1]` as
+     prior. Zero change to output shape or downstream consumers.
+
+REV 3.7 (2026-10-04) — LIQUIDITY SWEEP + FVG ZONES:
   ✅ Added _liquidity_sweep() — detects stop-hunt reversals on the
      most recent closed bar. Gated by GLOBAL["use_liquidity_sweep"].
      Output keys: sweep_bull, sweep_bear, sweep_bull_low,
@@ -15,27 +27,7 @@ REV 3.7 (2026-10-04) — LIQUIDITY SWEEP + FVG ZONES (NEW):
   ✅ Zero behaviour change for existing consumers — all previous
      output keys unchanged.
 
-REV 3.6 (2026-10-03) — FLAG GATING + DIV-BY-ZERO + DEAD STUB CLEANUP:
-  ✅ Modern indicator flags now HONOURED (were declared in GLOBAL but
-     ignored here):
-       • use_taker_volume   → gates _taker_features()
-       • use_volume_profile → gates _volume_profile()
-       • use_anchored_vwap  → gates _anchored_vwap()
-     Matches the existing use_funding_z gate pattern (REV 3.5).
-     Output keys ALWAYS present (empty defaults when disabled) so
-     downstream .get() reads don't change shape.
-     ► NOTE for users: previous behaviour was "compute regardless of
-       flag". If you relied on real values while flag=False, set the
-       corresponding CC_USE_* env or .env flag to True.
-  ✅ FIXED: `dx` divide-by-zero — was `.fillna(0)` which does NOT
-     catch inf. Now `.replace(0, 1e-9).fillna(0)` matching the
-     pattern in _detect_regime().
-  ✅ Dead `liq` stub dict REMOVED (REV 3.4 removed the populating
-     functions). Three legacy output keys (`long_liq_usd`,
-     `short_liq_usd`, `liq_bias`) retained as 0.0/0.0/"BALANCED"
-     literals for backward compat with any downstream .get() readers.
-  ✅ Zero behaviour change for the current .env (all three flags True).
-
+REV 3.6 (2026-10-03) — FLAG GATING + DIV-BY-ZERO + DEAD STUB CLEANUP.
 REV 3.5 (2026-10-02) — DEAD IMPORT + LIVE FUNDING_Z READ.
 REV 3.4 (2026-10-02) — DEAD FUNCTION CLEANUP.
 REV 3.3 (2026-10-02) — FULLY DELEGATED TO config_center.
@@ -832,16 +824,27 @@ def _order_blocks(df: pd.DataFrame, lookback: int = 50) -> dict:
 
 # ─────────────────────────────────────────────────────────────
 # LIQUIDITY SWEEP DETECTION (REV 3.7 — NEW)
+# REV 3.7.1 — DOUBLE-DROP FIX
 # ─────────────────────────────────────────────────────────────
 def _liquidity_sweep(df: pd.DataFrame, lookback: int = 20) -> dict:
     """
     Detect liquidity sweeps (stop hunts) on the most recent closed bar.
 
+    REV 3.7.1 — IMPORTANT: `df` here is ALREADY closed-only data.
+      Callers (future.py::_fetch_coin_indicators, calculate_pro_indicators)
+      pass `df.iloc[:-1]` — i.e. the in-progress bar has already been
+      dropped upstream. This function therefore uses `df.iloc[-1]` as
+      the current (most recent closed) bar and `df.iloc[-(lookback+1):-1]`
+      as the prior lookback window. The previous REV 3.7 code did
+      ANOTHER `.iloc[:-1]` internally — evaluating the second-to-last
+      closed bar instead of the latest. Sweeps were detected one bar
+      late.
+
     Bullish sweep (BUY signal):
-      - Current bar wicks BELOW the 20-bar low
+      - Current bar wicks BELOW the prior N-bar low
       - But CLOSES back ABOVE it
       - Lower wick >= 2x body
-      - Volume above 5-bar average
+      - Volume above N-bar average
 
     Bearish sweep (SELL signal): mirror logic.
     """
@@ -850,13 +853,15 @@ def _liquidity_sweep(df: pd.DataFrame, lookback: int = 20) -> dict:
         "sweep_bull_low": 0.0, "sweep_bear_high": 0.0,
         "sweep_strength": 0.0,
     }
-    if df is None or len(df) < lookback + 6:
+    # Need at least lookback prior bars + 1 current bar.
+    if df is None or len(df) < lookback + 2:
         return empty
 
     try:
-        closed = df.iloc[:-1]                     # drop in-progress bar
-        prior = closed.iloc[-(lookback + 1):-1]
-        curr = closed.iloc[-1]
+        # ── REV 3.7.1 — df is already closed-only; use the last row
+        # as `curr` and the preceding `lookback` rows as `prior`. ──
+        prior = df.iloc[-(lookback + 1):-1]
+        curr = df.iloc[-1]
 
         prev_low = float(prior["Low"].min())
         prev_high = float(prior["High"].max())
@@ -869,6 +874,9 @@ def _liquidity_sweep(df: pd.DataFrame, lookback: int = 20) -> dict:
         upper_wick = c_h - max(c_o, c_c)
         rng = c_h - c_l if c_h > c_l else 1e-9
 
+        # Volume check uses the last 5 bars of `df` (excluding curr's
+        # own bar) as the baseline, and curr's own volume as v_now.
+        # vol.iloc[-6:-1] = the 5 bars before the last; vol.iloc[-1] = curr.
         vol = df["Volume"].astype(float) if "Volume" in df.columns else None
         vol_ok = True
         if vol is not None and len(vol) >= 6:
@@ -1098,7 +1106,7 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
         avwap = {"anchored_vwap": 0.0, "avwap_dist_pct": 0.0}
 
     # ═══════════════════════════════════════════════════════════
-    #  REV 3.7 — LIQUIDITY SWEEP + FVG ZONES (NEW)
+    #  REV 3.7 / 3.7.1 — LIQUIDITY SWEEP + FVG ZONES
     # ═══════════════════════════════════════════════════════════
     if bool(_cc_get("use_liquidity_sweep", True)):
         sweep = _liquidity_sweep(df)
@@ -1204,7 +1212,7 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
         "funding_z": funding_z["funding_z"],
 
         # ═══════════════════════════════════════════════════════
-        #  REV 3.7 — LIQUIDITY SWEEP OUTPUT (NEW)
+        #  REV 3.7 — LIQUIDITY SWEEP OUTPUT
         # ═══════════════════════════════════════════════════════
         "sweep_bull": sweep["sweep_bull"],
         "sweep_bear": sweep["sweep_bear"],
@@ -1213,7 +1221,7 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
         "sweep_strength": sweep["sweep_strength"],
 
         # ═══════════════════════════════════════════════════════
-        #  REV 3.7 — FVG ZONES OUTPUT (NEW)
+        #  REV 3.7 — FVG ZONES OUTPUT
         # ═══════════════════════════════════════════════════════
         "fvg_zone_bull_top": fvg_nearest_bull["top"] if fvg_nearest_bull else 0.0,
         "fvg_zone_bull_bottom": fvg_nearest_bull["bottom"] if fvg_nearest_bull else 0.0,

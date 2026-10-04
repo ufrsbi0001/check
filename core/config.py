@@ -1,6 +1,21 @@
 """
 config.py — Environment / infrastructure configuration ONLY.
 
+REV 2.0.2 (2026-10-04) — SECURE DEFAULT HOST:
+  ✅ CHANGED: HOST default is now "127.0.0.1" (was "0.0.0.0").
+     Fresh installs previously bound the Flask dashboard to ALL
+     network interfaces — anyone on the same LAN/WiFi could reach
+     http://<your-ip>:5000 and hit the trading API. The after_request
+     warning in web/app.py logged this, but the default itself was
+     unsafe.
+     To expose the dashboard on a LAN (e.g. access from your phone),
+     set HOST=0.0.0.0 in .env explicitly. When doing so, the app
+     logs a loud warning at startup reminding you to put it behind
+     a reverse proxy + TLS + auth.
+  ✅ Zero behaviour change for existing .env files that already set
+     HOST explicitly (their value wins either way).
+  ✅ Zero change to any other field, path, or validation rule.
+
 REV 2.0.1 (2026-10-03) — PROXY HARDENING:
   ✅ _ATTR_TO_CC_KEY renamed to _PROXIED_TRADING_ATTRS and expanded
      to an EXPLICIT full map of every trading attribute this module
@@ -39,6 +54,7 @@ Design goals:
   • All file paths anchored to DATA_DIR
   • Coin universe sourced EXCLUSIVELY from coins_config.py or .env
   • NO trading param duplicated here — proxy only, source in CC
+  • Secure-by-default HOST (localhost only)
 """
 from __future__ import annotations
 
@@ -427,7 +443,10 @@ def load_config() -> Config:
         telegram_chat_id=_str("TELEGRAM_CHAT_ID"),
 
         # ── Web server ──
-        host=_str("HOST", "0.0.0.0"),
+        # REV 2.0.2 — secure default: bind only to localhost. To expose
+        # on LAN, set HOST=0.0.0.0 in .env explicitly (see startup
+        # warning in web/app.py).
+        host=_str("HOST", "127.0.0.1"),
         port=_int("PORT", 5000),
         allowed_origins=_csv_str("ALLOWED_ORIGINS", "*"),
 
