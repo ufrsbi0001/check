@@ -1,49 +1,28 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
-REV 1.4.39 (2026-10-04) — ARM ORPHAN-WATCH ON DIRECT-CLI PATH:
-  ✅ `python future.py` (direct CLI) uses `_reconcile_on_startup()`
-     instead of `sync_existing_positions()`. The web-dashboard path
-     (main_loop) arms the orphan-watch via orders/repair.py REV 1.7.4,
-     but the CLI path bypassed it — so TM thread's orphan-watch stayed
-     silent until main_loop ran its own sync (~100s later).
-  ✅ Now `__main__` explicitly calls `mark_startup_sync_done()`
-     immediately after `_reconcile_on_startup()` finishes. The call
-     is idempotent, so the subsequent main_loop sync is harmless.
-  ✅ Zero change to the web path — `mark_startup_sync_done()` is
-     called once by repair.py and once here, whichever path runs
-     first wins. Second call just re-sets a bool to True.
+REV 1.4.40 (2026-10-04) — IN-POSITION VISIBILITY IN SCANNER:
+  ✅ FIXED: The `action` column previously showed "IN POSITION" only
+     for coins whose signal had fired and passed all filters — because
+     the IN POSITION check lived inside the `if trade_side:` block. A
+     coin that was already held but whose CURRENT signal happened to
+     be NEUTRAL showed the raw signal-rejection reason instead
+     (e.g. "SKIP (RANGE_SCALPER:no_pattern)"), making it look like the
+     bot was ignoring the open trade.
+  ✅ Now: `_has_open_position` is computed from active_trades_list at
+     the top of the coin loop. If True, the action column shows
+     "IN POSITION" regardless of what the signal did.
+  ✅ Display-only change. Zero effect on trading logic — the position
+     management path (manage_single_trade) is unchanged.
+  ✅ Effect: scanner rows for TRX, CRV, UNI, AVAX, XPL now show
+     "IN POSITION" (previously they showed SKIP reasons because their
+     1h signal was NEUTRAL). OP already showed "IN POSITION" because
+     its signal fired; now all 6 open coins are consistent.
 
-REV 1.4.38 (2026-10-04) — PATTERN COLUMN NOW SHOWS ACTUAL STRATEGY:
-  ✅ FIXED: The `pattern` field in scan_rows was hardcoded to
-     "TrendPullback" — a leftover from the earlier TREND_PULLBACK-only
-     design. It is now derived from the actual strategy that the
-     family router evaluated (or rejected with). Sources:
-       • "strat=NAME"  → signal fired, NAME produced it
-       • "NAME:reason" → NEUTRAL, NAME rejected it
-       • "—"           → nothing to show (no strategy touched it)
-     UI impact: the PATTERN column in the Market Scanner becomes
-     meaningful. It now matches the strategy in the ACTION column
-     for NEUTRAL rows (e.g. both show "RANGE_SCALPER"). For fired
-     signals it shows the exact strategy (e.g. "SUPERTREND_RIDE").
-     Zero change to any trading logic — display-only.
-
-REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP:
-  ✅ Removed dead `_cfg = _i.get_trading_config()` at the top of
-     main_loop(). The variable was never read anywhere in main_loop —
-     the loop body uses its own `cfg = _i.get_trading_config()` for
-     the per-coin RR floor. So the top-level assignment was pure
-     dead code (an extra deepcopy of GLOBAL per startup for nothing).
-     Zero functional change.
-
-REV 1.4.36 (2026-10-04) — LOG BANNER SYNC TO 9-FILTER ENGINE:
-  ✅ Startup banner now logs "9-filter vote, N/9 required" instead of
-     "6-filter vote, N/6 required". The engine has been 9 filters
-     since decision_engine REV 4.5 + config_center REV 6.1, but the
-     banner was left at the old count. Zero functional change — only
-     the printed banner text.
-  ✅ "Running in TUNED mode — MIN_APPROVALS=N/6" → "N/9".
-
+REV 1.4.39 (2026-10-04) — ARM ORPHAN-WATCH ON DIRECT-CLI PATH.
+REV 1.4.38 (2026-10-04) — PATTERN COLUMN NOW SHOWS ACTUAL STRATEGY.
+REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP.
+REV 1.4.36 (2026-10-04) — LOG BANNER SYNC TO 9-FILTER ENGINE.
 REV 1.4.35 (2026-10-04) — DEV-MODE ENTRY GUARD (Point 1) (retained).
 REV 1.4.34 (2026-10-04) — OBSERVABILITY UPGRADE (Point 5) (retained).
 REV 1.4.33 (2026-10-04) — ADOPTED SL FROM CONFIG (Point 4) (retained).
@@ -1257,6 +1236,15 @@ def main_loop():
                     _family = _safe_family(coin)
                     live_price = live_prices.get(coin, 0.0)
 
+                    # ── REV 1.4.40 — position-state snapshot ──
+                    # Computed BEFORE the signal branch so the ACTION
+                    # column shows IN POSITION for every open coin,
+                    # regardless of what the signal did this cycle.
+                    _has_open_position = any(
+                        t.get('symbol') == symbol
+                        for t in active_trades_list
+                    )
+
                     if not ind_1h or not ind_4h or df_1h is None:
                         scan_rows.append({
                             'symbol': symbol,
@@ -1265,7 +1253,9 @@ def main_loop():
                             # REV 1.4.38 — "—" instead of "TrendPullback"
                             'pattern': '—', 'regime': 'UNKNOWN',
                             'killzone': '-', 'family': _family,
-                            'action': 'No Data'
+                            # REV 1.4.40 — still respect position state
+                            'action': ('IN POSITION' if _has_open_position
+                                       else 'No Data')
                         })
                         continue
 
@@ -1362,8 +1352,7 @@ def main_loop():
                             _s.increment_v2_stat('rotation')
 
                     if _pre_block_reason is None and trade_side:
-                        if any(t.get('symbol') == symbol
-                               for t in active_trades_list):
+                        if _has_open_position:
                             _pre_block_reason = "IN POSITION"
 
                     if _pre_block_reason is None and trade_side and candle_time is not None:
@@ -1402,9 +1391,7 @@ def main_loop():
                                 f"{type(_de).__name__}: {_de} — allowing trade"
                             )
 
-                    if trade_side and any(
-                        t.get('symbol') == symbol for t in active_trades_list
-                    ):
+                    if trade_side and _has_open_position:
                         trade_side = None
                         skip_reason = "IN POSITION"
 
@@ -1484,7 +1471,22 @@ def main_loop():
                             with _s.ENTRY_CANDLE_LOCK:
                                 if symbol in _s.last_entry_candle:
                                     del _s.last_entry_candle[symbol]
-                            action = " FAILED"
+                            # REV 1.4.40 — even a failed entry on an open
+                            # position should read IN POSITION.
+                            if _has_open_position:
+                                action = "IN POSITION"
+                            else:
+                                action = " FAILED"
+
+                    # ── REV 1.4.40 — ACTION PRIORITY REORDER ──
+                    # If this coin is currently held by the bot, the
+                    # ACTION column reads "IN POSITION" regardless of
+                    # the signal outcome for this cycle. This makes
+                    # the scanner consistent: all open coins look the
+                    # same, whether their signal fired or not.
+                    elif _has_open_position:
+                        action = "IN POSITION"
+
                     elif skip_reason:
                         action = skip_reason
                     else:
