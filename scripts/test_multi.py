@@ -1,9 +1,36 @@
 """
 test_multi.py — Multi-coin signal test (temporary file).
 
-Chalao: python test_multi.py
+Chalao:
+    python -m scripts.test_multi
+
+Ya (agar upar wala fail ho):
+    set PYTHONPATH=%CD%
+    python scripts/test_multi.py
+
+REV 1.1 (2026-10-04) — TWO FIXES:
+  ✅ Path bootstrap added at top — `python scripts/test_multi.py`
+     previously raised ModuleNotFoundError: 'core' because Python
+     puts the SCRIPT's dir on sys.path, not the repo root. Now works
+     from both invocation styles.
+  ✅ Now passes CLOSED-ONLY data to calculate_pro_indicators(), matching
+     future.py::_fetch_coin_indicators. Previously the in-progress
+     (unclosed) bar was included, so sweep/regime detection was one
+     bar ahead of production behaviour.
+
 Baad mein delete kar dena.
 """
+from __future__ import annotations
+
+# ── Path bootstrap: make `core`, `signals`, `market` importable ──
+import pathlib
+import sys
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+# ─────────────────────────────────────────────────────────────────
+
 from core.client import set_client_keys, get_binance_klines
 from market.indicators import calculate_pro_indicators
 from signals.router import generate_signal_live
@@ -31,12 +58,15 @@ sweeps = 0
 
 for sym in coins:
     try:
-        df = get_binance_klines(sym, '1h', 250)
-        if df is None or len(df) < 60:
+        df_raw = get_binance_klines(sym, '1h', 250)
+        if df_raw is None or len(df_raw) < 60:
             print(f'{sym:<15} NO DATA')
             continue
 
-        ind = calculate_pro_indicators(df, '1h', sym)
+        # ── FIX: drop the in-progress bar, match production behaviour ──
+        df_closed = df_raw.iloc[:-1]
+
+        ind = calculate_pro_indicators(df_closed, '1h', symbol=sym)
         if ind is None:
             print(f'{sym:<15} INDICATORS FAILED')
             continue
