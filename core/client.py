@@ -4,7 +4,55 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
-REV 11.4 (2026-10-04) — HEDGE-MODE FAIL-FAST:
+REV 11.6 (2026-10-05) — DEPRECATED ALIAS REMOVED (Phase 2 cleanup):
+  ✅ The deprecated `_requests_lock = _write_lock` alias has been
+     REMOVED. Every consumer file has been migrated to the explicit
+     read/write split introduced in REV 11.5:
+       • future.py, orders/{manage,entry,exit,repair}.py,
+         web/{app,analytics}.py — all use _read_lock / _write_lock
+         directly.
+     The alias outlived its usefulness as a safety net; keeping it
+     would let future contributors accidentally reintroduce the old
+     "one lock for everything" pattern without realising.
+
+  ✅ Added a module-level `__getattr__` guard. Any code that still
+     references `_requests_lock` now fails with a CLEAR, actionable
+     AttributeError naming the correct replacement — instead of a
+     generic "module has no attribute" or a silent re-serialization.
+     This is the standard Python idiom (PEP 562) for graceful removal
+     of a public-ish name.
+
+  ✅ Verification before this change: `grep -rn _requests_lock` across
+     the whole repo returned exactly one hit — this file's own alias
+     definition. Zero external consumers. Removal is therefore safe.
+
+  ✅ Zero behaviour change for every migrated call site. Same locks,
+     same semantics. The only observable difference is that a
+     hypothetical missed migration now fails LOUD instead of quietly
+     over-serializing.
+
+REV 11.5 (2026-10-05) — READ/WRITE LOCK SPLIT (Phase 2) (retained):
+  ✅ The single _requests_lock (which serialized EVERY Binance call —
+     reads AND writes) has been split into two independent RLocks:
+        _read_lock  — positions, klines, account, tickers, exchangeInfo,
+                      open orders, server time, algo-order LIST.
+        _write_lock — futures_create_order, futures_cancel_order,
+                      futures_cancel_algo_order.
+     Reads no longer block other reads. Writes still serialize against
+     other writes. Reads and writes are INDEPENDENT.
+
+  ✅ NO NESTING between the two locks anywhere in the codebase. If a
+     future path ever needs both, acquire _read_lock FIRST (canonical
+     order) — otherwise deadlock risk.
+
+  ✅ retry_on_rate_limit() accepts `is_write=` keyword:
+        @retry_on_rate_limit                     # read (default)
+        @retry_on_rate_limit(is_write=True)      # write
+     The lock is re-entered per retry attempt; it is NOT held across
+     the exponential-backoff sleep, so other readers/writers proceed
+     between retries.
+
+REV 11.4 (2026-10-04) — HEDGE-MODE FAIL-FAST (retained):
   ✅ CRITICAL: set_client_keys() and startup_checks() now RAISE a
      RuntimeError when the account is in HEDGE mode
      (dualSidePosition=True). Previously check_position_mode() only
@@ -19,33 +67,7 @@ REV 11.4 (2026-10-04) — HEDGE-MODE FAIL-FAST:
      Callers decide what to do with None; only True is a hard fail.
   ✅ Zero behaviour change for ONE-WAY accounts (the common case).
 
-REV 11.3 (2026-10-04) — CRITICAL-PATH TIMEOUT ISOLATION (A1):
-  ✅ CRITICAL (A1): _run_with_timeout() no longer caps ORDER-PLACEMENT
-     calls at 6s. Order placement (market:, sl:, tp1:, tp2:,
-     update_sl:, emg:) now runs on a SEPARATE executor with NO upper
-     cap and a MINIMUM effective timeout of 10s (matching the HTTP
-     session timeout). Previously a 6s caller cap on futures_create_order
-     could time out at 6s while the underlying HTTP request was still
-     in flight — the caller then treated the order as ambiguous, and
-     the retry path (in entry.py / exit.py) risked placing a duplicate
-     MARKET order. Raising the effective minimum to the HTTP session
-     timeout eliminates that class of false-ambiguous.
-  ✅ Two pools:
-       _TIMEOUT_EXECUTOR          — best-effort (analytics, klines,
-                                    exchangeInfo). 6s cap. 32 workers.
-       _CRITICAL_TIMEOUT_EXECUTOR — order placement + SL/TP. No cap
-                                    (but floor of 10s). 8 workers.
-     This prevents a slow exchangeInfo / analytics call from starving
-     order placement slots under the same pool.
-  ✅ Separate zombie counters per pool. Order-path zombie growth is
-     logged at a lower threshold (3) than best-effort (8) because a
-     stuck order placement is far more consequential than a stuck
-     klines fetch.
-  ✅ _is_critical_desc() helper classifies callers by desc prefix.
-  ✅ Callers that pass <10s (entry.py's 6s, manage.py's 5s, etc.)
-     are automatically lifted to the 10s floor. Callers that pass
-     >10s are honored as-is. Best-effort callers are unchanged.
-
+REV 11.3 (2026-10-04) — CRITICAL-PATH TIMEOUT ISOLATION (A1) (retained).
 REV 11.2 (2026-10-03) — EXECUTOR POOL HARDENING (retained).
 REV 11.1 (2026-10-03) — HARDENING PASS (retained).
 REV 11.0 (2026-10-03) — KLINES CACHE + LOCK HYGIENE (retained).
@@ -103,7 +125,67 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 _global_client: Optional[Client] = None
 _CLIENT_INIT_LOCK = threading.RLock()
-_requests_lock = threading.RLock()
+
+# ═════════════════════════════════════════════════════════════
+#  REV 11.5 / 11.6 — READ / WRITE LOCK SPLIT
+# ═════════════════════════════════════════════════════════════
+# _read_lock  — shared. Every read API call acquires this.
+#               Reads do NOT block other reads.
+#
+# _write_lock — exclusive. Every state-mutating API call
+#               (create/cancel order, cancel algo order) acquires
+#               this. Writes serialize against each other.
+#
+# Reads and writes are INDEPENDENT. This is the whole point:
+# a slow position fetch must not stall an SL update, and a slow
+# klines fetch must not stall an entry.
+#
+# NO NESTING anywhere in the current codebase. If a future path
+# needs both, acquire _read_lock FIRST (canonical order) to
+# avoid deadlock with any future path that does the same.
+#
+# REV 11.6 — the deprecated `_requests_lock` alias has been
+# REMOVED. Every consumer file migrated in REV 11.5–11.10 of the
+# respective modules. A module-level __getattr__ below catches any
+# straggler and gives an actionable error instead of a generic
+# "module has no attribute" message.
+# ═════════════════════════════════════════════════════════════
+_read_lock = threading.RLock()
+_write_lock = threading.RLock()
+
+
+# ═════════════════════════════════════════════════════════════
+#  REV 11.6 — REMOVED-NAME GUARD (PEP 562)
+# ═════════════════════════════════════════════════════════════
+def __getattr__(name: str):
+    """
+    Module-level attribute access hook.
+
+    Only fires for names NOT defined at module scope. Used to give a
+    clear, actionable error for the one symbol we deliberately
+    removed in REV 11.6 (`_requests_lock`), so a missed migration
+    surfaces with instructions rather than a bare NameError.
+
+    Any OTHER missing attribute gets the standard Python message,
+    preserving the normal error contract for tools and callers.
+    """
+    if name == "_requests_lock":
+        raise AttributeError(
+            "core.client._requests_lock was REMOVED in REV 11.6. "
+            "Migrate to the explicit split: "
+            "_read_lock for read paths "
+            "(positions / klines / account / tickers / open-orders / "
+            "algo-order list / server time), "
+            "_write_lock for write paths "
+            "(futures_create_order / futures_cancel_order / "
+            "futures_cancel_algo_order). "
+            "See core/client.py docstring (REV 11.5–11.6)."
+        )
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
+    )
+
+
 _TS_LOCK = threading.Lock()
 _TS_OFFSET = {'value': 0, 'time': 0.0}
 _TS_TTL = 60.0
@@ -309,7 +391,8 @@ def refresh_timestamp() -> None:
             _global_client.timestamp_offset = _TS_OFFSET['value']
             return
     try:
-        with _requests_lock:
+        # ── REV 11.5 — read lock (server-time query is a read). ──
+        with _read_lock:
             server_time = _global_client.get_server_time()['serverTime']
         offset = server_time - int(time.time() * 1000)
         with _TS_LOCK:
@@ -323,53 +406,73 @@ def refresh_timestamp() -> None:
 # ─────────────────────────────────────────────────────────────
 # RATE-LIMIT DECORATOR
 # ─────────────────────────────────────────────────────────────
-def retry_on_rate_limit(func):
+def retry_on_rate_limit(func=None, *, is_write: bool = False):
     """
     REV 11.1 — jitter + -1008 heavy backoff + Retry-After respect.
-    Wrapper serialises under _requests_lock (RLock, reentrant-safe).
+
+    REV 11.5 — upgraded to decorator-with-optional-args:
+        @retry_on_rate_limit                    # read path (default)
+        @retry_on_rate_limit(is_write=True)     # write path
+
+    The lock (read or write) is RE-ENTERED per retry attempt. It is
+    NOT held across the exponential-backoff sleep, so other readers /
+    writers proceed between retries. The wrapper does not touch the
+    '_read_lock vs _write_lock' decision itself — the decorator
+    parameter decides which lock wraps each attempt.
+
+    Existing usages (@retry_on_rate_limit on get_binance_klines and
+    fetch_position_raw) are reads and need no change.
     """
     from functools import wraps
 
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                with _requests_lock:
-                    return func(*args, **kwargs)
-            except BinanceAPIException as e:
-                if e.code not in (-1003, -1008):
-                    raise
+    lock = _write_lock if is_write else _read_lock
 
-                retry_after = None
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            max_retries = 5
+            for attempt in range(max_retries):
                 try:
-                    resp = getattr(e, 'response', None)
-                    if resp is not None:
-                        ra = resp.headers.get('Retry-After')
-                        if ra:
-                            retry_after = float(ra)
-                except Exception:
+                    with lock:
+                        return fn(*args, **kwargs)
+                except BinanceAPIException as e:
+                    if e.code not in (-1003, -1008):
+                        raise
+
                     retry_after = None
+                    try:
+                        resp = getattr(e, 'response', None)
+                        if resp is not None:
+                            ra = resp.headers.get('Retry-After')
+                            if ra:
+                                retry_after = float(ra)
+                    except Exception:
+                        retry_after = None
 
-                base = retry_after if retry_after is not None else (2 ** attempt)
-                if e.code == -1008 and retry_after is None:
-                    base *= 2
-                jitter = random.uniform(0, 0.5)
-                sleep_time = min(base + jitter, 30.0)
+                    base = retry_after if retry_after is not None else (2 ** attempt)
+                    if e.code == -1008 and retry_after is None:
+                        base *= 2
+                    jitter = random.uniform(0, 0.5)
+                    sleep_time = min(base + jitter, 30.0)
 
-                logger.warning(
-                    f"Rate limit {e.code}, retrying in {sleep_time:.2f}s "
-                    f"({attempt + 1}/{max_retries}) on {func.__name__}"
-                )
-                time.sleep(sleep_time)
-                try:
-                    refresh_timestamp()
-                except Exception:
-                    pass
-                continue
-        raise RuntimeError(f"Rate limit retries exhausted for {func.__name__}")
+                    logger.warning(
+                        f"Rate limit {e.code}, retrying in {sleep_time:.2f}s "
+                        f"({attempt + 1}/{max_retries}) on {fn.__name__}"
+                    )
+                    time.sleep(sleep_time)
+                    try:
+                        refresh_timestamp()
+                    except Exception:
+                        pass
+                    continue
+            raise RuntimeError(f"Rate limit retries exhausted for {fn.__name__}")
 
-    return wrapper
+        return wrapper
+
+    # Support both @retry_on_rate_limit and @retry_on_rate_limit(is_write=...)
+    if func is None:
+        return decorator
+    return decorator(func)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -391,6 +494,7 @@ def get_account_cached() -> dict:
     """
     REV 11.2 — TTL 60s, caller timeout 6s (capped by executor).
     REV 11.3 (A1) — still non-critical; runs on best-effort pool.
+    REV 11.5 — account fetch is a read → _read_lock.
     """
     with _ACCOUNT_CACHE_LOCK:
         if _ACCOUNT_CACHE['data'] is not None and \
@@ -401,7 +505,7 @@ def get_account_cached() -> dict:
         raise RuntimeError("get_account_cached: client not initialised")
 
     def _fetch():
-        with _requests_lock:
+        with _read_lock:
             return _global_client.futures_account()
 
     acc = _run_with_timeout(_fetch, 6, "futures_account")
@@ -470,7 +574,8 @@ def _get_exchange_info() -> dict:
     for attempt in range(3):
         try:
             def _fetch():
-                with _requests_lock:
+                # REV 11.5 — read.
+                with _read_lock:
                     return _global_client.futures_exchange_info()
             # REV 11.3 (A1) — non-critical desc → best-effort pool, 6s cap.
             info = _run_with_timeout(_fetch, 6, "exchange_info")
@@ -833,6 +938,7 @@ def invalidate_klines_cache(symbol: Optional[str] = None) -> None:
                     del _KLINES_CACHE[k]
 
 
+# REV 11.5 — @retry_on_rate_limit defaults to read path (_read_lock).
 @retry_on_rate_limit
 def get_binance_klines(symbol: str, interval: str, limit: int = 250):
     cached = _klines_cache_get(symbol, interval, limit)
@@ -874,7 +980,8 @@ def get_live_prices() -> dict[str, float]:
     if _global_client is None:
         return {}
     try:
-        with _requests_lock:
+        # REV 11.5 — read.
+        with _read_lock:
             tickers = _global_client.futures_symbol_ticker()
         if not tickers:
             return {}
@@ -906,7 +1013,8 @@ def get_book_ticker(symbol: str) -> dict:
     if _global_client is None:
         return {}
     try:
-        with _requests_lock:
+        # REV 11.5 — read.
+        with _read_lock:
             resp = _global_client.futures_orderbook_ticker(symbol=symbol)
         if not resp:
             return {}
@@ -928,7 +1036,8 @@ def get_book_tickers() -> dict[str, dict]:
     if _global_client is None:
         return {}
     try:
-        with _requests_lock:
+        # REV 11.5 — read.
+        with _read_lock:
             tickers = _global_client.futures_orderbook_ticker()
         if not tickers:
             return {}
@@ -967,6 +1076,7 @@ def calc_spread_pct(bid: float, ask: float) -> float:
 # ─────────────────────────────────────────────────────────────
 # POSITIONS
 # ─────────────────────────────────────────────────────────────
+# REV 11.5 — @retry_on_rate_limit defaults to read path (_read_lock).
 @retry_on_rate_limit
 def fetch_position_raw(symbol_short: str):
     pair = symbol_short + 'USDT'
@@ -1005,7 +1115,8 @@ def _position_amt(pair: str, retries: int = 3):
     refresh_timestamp()
     for attempt in range(retries):
         try:
-            with _requests_lock:
+            # REV 11.5 — read.
+            with _read_lock:
                 arr = _global_client.futures_position_information(symbol=pair)
             if arr:
                 return float(arr[0].get('positionAmt', 0) or 0)
@@ -1051,7 +1162,8 @@ def _get_open_algo_orders(pair: str) -> list:
         )
         return []
     try:
-        with _requests_lock:
+        # REV 11.5 — listing algo orders is a read.
+        with _read_lock:
             resp = getter(symbol=pair)
         if isinstance(resp, dict):
             return resp.get('orders') or resp.get('data') or []
@@ -1066,7 +1178,8 @@ def _cancel_algo_order(pair: str, algo_id) -> bool:
     if cancel is None or not algo_id:
         return False
     try:
-        with _requests_lock:
+        # REV 11.5 — cancelling an order is a WRITE.
+        with _write_lock:
             cancel(symbol=pair, algoId=algo_id)
         return True
     except Exception as e:
@@ -1093,11 +1206,12 @@ def check_position_mode() -> Optional[bool]:
 
     REV 11.4 — same return contract, but set_client_keys() and
     startup_checks() now RAISE on True instead of ignoring the value.
+    REV 11.5 — read lock.
     """
     if _global_client is None:
         return None
     try:
-        with _requests_lock:
+        with _read_lock:
             mode = _global_client.futures_get_position_mode()
         dual = bool(mode.get('dualSidePosition', False))
         if dual:

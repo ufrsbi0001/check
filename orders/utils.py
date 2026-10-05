@@ -1,6 +1,25 @@
 """
 orders/utils.py — Shared constants and low-level helpers.
 
+REV 23.4 (2026-10-05) — READ-LOCK MIGRATION (Phase 2, final):
+  ✅ Two sites in this file were UNGUARDED against the shared
+     python-binance session even before Phase 2 — they were the only
+     remaining cross-thread Binance calls outside of a lock:
+       • _pick_real_sl()       → client.futures_get_open_orders
+       • get_trade_status()    → client.futures_position_information
+                                 (only in the `pos is None` branch)
+     Both are READS → migrated to _read_lock (core/client.py REV 11.5).
+
+     Effect: two consequences, both good:
+       1. Session safety: the shared HTTP session is no longer touched
+          without coordination. Consistent with the rest of the codebase.
+       2. Race safety: reconcile_active_trade's SL discovery is now
+          atomic w.r.t. concurrent SL writes (its own outer lock is
+          per-symbol; the shared _read_lock prevents interleaving with
+          the write path that mutates the exchange order book).
+
+     Zero behaviour change. Same return values, same error handling.
+
 REV 23.3 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE:
   ✅ `get_trade_status()` computes PnL from `breakEvenPrice` (which
      includes entry commission), NOT `entryPrice`. This is what
@@ -27,6 +46,10 @@ from core.config import CONFIG
 from core.client import (
     get_client, refresh_timestamp, _run_with_timeout,
     _get_open_algo_orders, logger,
+    # ── REV 23.4 — explicit read lock (Phase 2). ──
+    # Both sites in this file are READS. The write path lives entirely
+    # in entry.py / manage.py / exit.py / repair.py — never here.
+    _read_lock,
 )
 from core.state import PKT, get_active_trade
 from core.coins_config import get_coin_vol_class
@@ -126,8 +149,15 @@ def _pick_real_sl(pair, entry, is_long):
         return None, []
 
     try:
+        # ── REV 23.4 — read lock (was unguarded). ──
+        # Held for the duration of the open-orders fetch only; the
+        # subsequent processing (parsing, filtering) runs lock-free.
+        def _fetch_open_orders():
+            with _read_lock:
+                return client.futures_get_open_orders(symbol=pair)
+
         orders = _run_with_timeout(
-            lambda: client.futures_get_open_orders(symbol=pair),
+            _fetch_open_orders,
             4, f"pick_sl:{pair}"
         )
         for o in orders or []:
@@ -145,6 +175,8 @@ def _pick_real_sl(pair, entry, is_long):
 
     if not candidates:
         try:
+            # _get_open_algo_orders acquires _read_lock internally
+            # (core/client.py REV 11.5) — no outer lock needed here.
             for o in _get_open_algo_orders(pair):
                 otype = (o.get('type') or o.get('orderType') or '').upper()
                 if otype not in ('STOP_MARKET', 'STOP'):
@@ -217,6 +249,7 @@ def get_trade_status(symbol, pos: dict = None):
     REV 23.2 — adds `roi_pct` (leverage × price move) and `leverage`.
     REV 23.2.1 — leverage falls back to config_center.leverage.
     REV 23.3 — PnL now computed from breakEvenPrice (Binance UI parity).
+    REV 23.4 — position fetch (when pos=None) wrapped in _read_lock.
     """
     pair = symbol + 'USDT'
     client = _cl()
@@ -225,7 +258,9 @@ def get_trade_status(symbol, pos: dict = None):
     try:
         if pos is None:
             refresh_timestamp()
-            pos_list = client.futures_position_information(symbol=pair)
+            # ── REV 23.4 — read lock (was unguarded). ──
+            with _read_lock:
+                pos_list = client.futures_position_information(symbol=pair)
             if not pos_list:
                 return None
             pos = pos_list[0]

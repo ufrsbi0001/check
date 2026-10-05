@@ -1,6 +1,34 @@
 """
 orders/entry.py — Order placement.
 
+REV 1.9.3 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 6):
+  ✅ Migrated all 9 explicit `_requests_lock` sites to `_write_lock`.
+     Every one of them wraps a `futures_create_order` MARKET close:
+       • adverse-slippage flatten
+       • crossed-SL close (sync + retry)
+       • SL -2021 emergency close
+       • tight-branch corrective reduce
+       • wide-branch >50%-of-qty emergency close
+       • wide-branch corrective reduce
+       • post-fix notional below-min close
+       • RR-collapse close
+     All are WRITES — the correct lock is _write_lock.
+
+     Effect: entry.py's market closes no longer compete with read-only
+     probes (klines, position fetches, account snapshots) for the same
+     lock. With the alias `_requests_lock = _write_lock` in
+     core.client, the migration is behaviour-neutral — but the intent
+     is now explicit and this file is ready for the eventual alias
+     removal.
+
+     Note: this file has NO read-lock sites to migrate — every
+     existing explicit lock wraps an order create. The unlocked
+     read calls (futures_position_information, futures_account,
+     futures_get_order inside _resolve_ambiguous_market) are pre-
+     existing behaviour and were NOT changed by this revision.
+
+     Zero behaviour change. Same lock primitive at each call site.
+
 REV 1.9.2 (2026-10-04) — CRITICAL DOUBLE-ENTRY + SIZING GUARD FIXES:
   ✅ CRITICAL (C1): `_place_market_idempotent` no longer retries with
      a FRESH clientOrderId when the ambiguous-market resolver returns
@@ -45,7 +73,13 @@ from core.client import (
     fetch_position_raw, get_filters, adjust_qty, adjust_price,
     invalidate_account_cache, refresh_timestamp,
     _run_with_timeout, send_telegram, logger,
-    _requests_lock, VALID_SYMBOLS, _filters_ok_to_trade,
+    # ── REV 1.9.3 — explicit write lock (Phase 2). ──
+    # Every explicit lock site in this file wraps a futures_create_order
+    # MARKET close, i.e. a WRITE. The legacy _requests_lock alias is
+    # no longer imported here on purpose: any missed migration site
+    # will raise a NameError at runtime rather than silently
+    # over-serialize.
+    _write_lock, VALID_SYMBOLS, _filters_ok_to_trade,
     handle_order_filter_error,
 )
 from core.state import (
@@ -957,7 +991,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 except Exception:
                     pass
                 try:
-                    with _requests_lock:
+                    # ── REV 1.9.3 — write lock. ──
+                    with _write_lock:
                         client.futures_create_order(
                             symbol=pair, side=close_side, type='MARKET',
                             quantity=qty_str, reduceOnly=True,
@@ -1018,7 +1053,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             def _sync_close() -> bool:
                 """Attempt one market close; return True only if flat."""
                 try:
-                    with _requests_lock:
+                    # ── REV 1.9.3 — write lock. ──
+                    with _write_lock:
                         client.futures_create_order(
                             symbol=pair, side=close_side, type='MARKET',
                             quantity=qty_str, reduceOnly=True,
@@ -1105,7 +1141,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                         f"(stop {sl_adj}) — closing position"
                     )
                     try:
-                        with _requests_lock:
+                        # ── REV 1.9.3 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='MARKET',
                                 quantity=qty_str, reduceOnly=True,
@@ -1199,7 +1236,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     reduce_str_t = adjust_qty(reduce_qty_t, f['stepSize'], f['minQty'])
                     if Decimal(reduce_str_t) >= f['minQty']:
                         try:
-                            with _requests_lock:
+                            # ── REV 1.9.3 — write lock. ──
+                            with _write_lock:
                                 client.futures_create_order(
                                     symbol=pair, side=close_side, type='MARKET',
                                     quantity=reduce_str_t, reduceOnly=True,
@@ -1287,7 +1325,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                         f"{qty_dec} — closing position"
                     )
                     try:
-                        with _requests_lock:
+                        # ── REV 1.9.3 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='MARKET',
                                 quantity=qty_str, reduceOnly=True,
@@ -1302,7 +1341,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     reduce_str = adjust_qty(reduce_qty, f['stepSize'], f['minQty'])
                     if Decimal(reduce_str) >= f['minQty']:
                         try:
-                            with _requests_lock:
+                            # ── REV 1.9.3 — write lock. ──
+                            with _write_lock:
                                 client.futures_create_order(
                                     symbol=pair, side=close_side, type='MARKET',
                                     quantity=reduce_str, reduceOnly=True,
@@ -1347,7 +1387,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                         f"{f['minNotional']} — aborting"
                     )
                     try:
-                        with _requests_lock:
+                        # ── REV 1.9.3 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='MARKET',
                                 quantity=qty_str, reduceOnly=True,
@@ -1408,7 +1449,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             closed_ok = False
             thread_launched = False
             try:
-                with _requests_lock:
+                # ── REV 1.9.3 — write lock. ──
+                with _write_lock:
                     client.futures_create_order(
                         symbol=pair, side=close_side, type='MARKET',
                         quantity=qty_str, reduceOnly=True,

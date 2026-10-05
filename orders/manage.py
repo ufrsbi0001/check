@@ -1,43 +1,47 @@
 """
 orders/manage.py — Trade management loop.
 
-REV 1.10.2 (2026-10-04) — ORPHAN-WATCH STARTUP GRACE:
-  ✅ CRITICAL: orphan-watch no longer fires during the startup window
-     between TM-thread launch and sync_existing_positions completion.
-     Root cause: web/app.py::bot_runner and future.py::__main__ both
-     start the TM thread BEFORE main_loop runs. main_loop's first
-     ~100 seconds are spent in validate_symbols (52-symbol
-     exchangeInfo check) and sync_existing_positions — during that
-     window bot_tracked_symbols is empty, so orphan-watch flagged
-     every real position as an orphan (6 false CRITICAL alerts in
-     the 17:39 log, cleared 50s later by sync).
+REV 1.10.4 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 4):
+  ✅ Migrated from the legacy `_requests_lock` (which aliases
+     _write_lock) to the explicit `_read_lock` / `_write_lock` split
+     introduced in core/client.py REV 11.5.
 
-     Fix: a module-level _STARTUP_SYNC_DONE flag. orphan-watch
-     early-returns while it's False. Once sync_existing_positions()
-     completes, callers call mark_startup_sync_done() to arm the
-     watch. See the call site in future.py::main_loop (right after
-     `_o.sync_existing_positions()`).
+     Classification applied:
+       • futures_get_open_orders           → _read_lock
+       • futures_position_information      → _read_lock
+       • futures_create_order              → _write_lock
+       • futures_cancel_order              → _write_lock
 
-     Behavioral change: only during startup. Once armed, the watch
-     behaves exactly as before. Real orphans that appear AFTER
-     startup are still detected and alerted normally.
+     Effect: the TM thread's read probes no longer serialize against
+     order placements from entry.py / repair.py. A slow position fetch
+     for symbol X cannot stall the BE SL update for symbol Y. Writes
+     still serialize against each other across the whole process.
 
-REV 1.10.1 (2026-10-04) — FAST-RECONCILE + SESSION-LOCK FIXES:
-  ✅ CRITICAL (C2): trade_manager_loop() now reconciles unverified /
-     partial_fill trades on EVERY iteration. Previously all trades
-     were on a 6-iteration stagger (~30s at 5s/cycle), which left
-     naked (unverified) positions unprotected for up to 30s. Fully
-     protected trades keep the stagger to reduce API load; unverified
-     trades get immediate attention.
-  ✅ A2: _detect_tp1_fill_and_move_be() now holds _requests_lock
-     around futures_get_open_orders. Every other cross-thread Binance
-     call wraps in this lock — the TP1 detection path was the last
-     outlier and could corrupt the shared requests.Session pool
-     under sustained load.
-  ✅ A2-adjacent: two additional futures_get_open_orders calls in
-     manage_single_trade's partial-70% block and the cancel-old-STOP
-     sweep now also hold _requests_lock.
+     Zero behaviour change. Only the lock primitive changed at each
+     call site — same code path, same retry semantics, same errors.
 
+     The deprecated alias `_requests_lock = _write_lock` still exists
+     in core.client for unmigrated files (entry.py, exit.py, repair.py,
+     web/*). Those continue to work — they just over-serialize until
+     migrated the same way.
+
+REV 1.10.3 (2026-10-05) — -2021 SL-SKIP VISIBILITY:
+  ✅ update_sl() now logs -2021 at WARNING instead of DEBUG.
+     -2021 (stop price crossed by mark) is EXPECTED in volatile
+     markets — the pre-check at the top of update_sl() guards the
+     common case, but mark can still move between the check and
+     the order placement. When it does, the OLD SL stays live and
+     valid, so this is not a safety issue.
+     It IS an observability issue: a burst of these means the bot
+     is repeatedly failing to tighten SLs and operators were blind
+     to it (DEBUG is invisible in prod log level INFO). Promoted
+     to WARNING so a slow-moving market that keeps outpacing SL
+     updates is visible in bot.log.
+     Zero behaviour change — same `return False`, same retry path,
+     same old-SL-still-active guarantee.
+
+REV 1.10.2 (2026-10-04) — ORPHAN-WATCH STARTUP GRACE (retained).
+REV 1.10.1 (2026-10-04) — FAST-RECONCILE + SESSION-LOCK FIXES (retained).
 REV 1.10.0 (2026-10-03) — RACE-SAFE SL LIFECYCLE (retained).
 REV 1.9.1 (2026-10-03) — DEFENSIVE HARDENING (retained).
 REV 1.9.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS (retained).
@@ -60,7 +64,11 @@ from core.client import (
     fetch_position_raw, get_filters, adjust_qty, adjust_price,
     refresh_timestamp, _run_with_timeout, _get_open_algo_orders,
     send_telegram, logger,
-    _requests_lock,
+    # ── REV 1.10.4 — explicit read/write locks (Phase 2). ──
+    # The legacy `_requests_lock` (== _write_lock alias) is no longer
+    # imported here on purpose: any missed migration site will raise
+    # a NameError at runtime rather than silently over-serialize.
+    _read_lock, _write_lock,
     handle_order_filter_error,   # REV 1.10.0
 )
 from core.state import (
@@ -147,7 +155,8 @@ def _new_cid(tag: str, pair: str) -> str:
 #  REV 1.6.2 — SL-first ordering.
 #  REV 1.10.0 — newClientOrderId; -2021 handled via market close;
 #               filter errors handled by code.
-#  REV 1.10.1 — A2: futures_get_open_orders wrapped in _requests_lock.
+#  REV 1.10.1 — A2: futures_get_open_orders wrapped in shared lock.
+#  REV 1.10.4 — read probe → _read_lock; order placement → _write_lock.
 # ═════════════════════════════════════════════════════════════
 def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
     try:
@@ -170,8 +179,8 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
 
     tp1_still_open = False
     try:
-        # ── REV 1.10.1 (A2) — hold shared-session lock. ──
-        with _requests_lock:
+        # ── REV 1.10.4 — read lock. ──
+        with _read_lock:
             _open_orders_tp1 = client.futures_get_open_orders(symbol=pair)
         for o in _open_orders_tp1:
             t = (o.get('type') or '').upper()
@@ -237,7 +246,8 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
     new_id = None
     for _attempt in range(2):
         try:
-            with _requests_lock:
+            # ── REV 1.10.4 — write lock. ──
+            with _write_lock:
                 resp = client.futures_create_order(
                     symbol=pair, side=close_side, type='STOP_MARKET',
                     stopPrice=be_adj, quantity=rem_qty, reduceOnly=True,
@@ -255,7 +265,8 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
                     f"market already crossed BE. Market-closing to lock."
                 )
                 try:
-                    with _requests_lock:
+                    # ── REV 1.10.4 — write lock. ──
+                    with _write_lock:
                         client.futures_create_order(
                             symbol=pair, side=close_side, type='MARKET',
                             quantity=rem_qty, reduceOnly=True,
@@ -347,6 +358,8 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
 
 # ═════════════════════════════════════════════════════════════
 #  manage_single_trade
+#  REV 1.10.4 — every explicit lock site classified:
+#               read probes → _read_lock, order placement → _write_lock.
 # ═════════════════════════════════════════════════════════════
 def manage_single_trade(symbol):
     pair = symbol + 'USDT'
@@ -476,7 +489,8 @@ def manage_single_trade(symbol):
                         qty_str_exit = adjust_qty(
                             abs(float(amt)), f['stepSize'], f['minQty']
                         )
-                        with _requests_lock:
+                        # ── REV 1.10.4 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='MARKET',
                                 quantity=qty_str_exit, reduceOnly=True,
@@ -589,7 +603,8 @@ def manage_single_trade(symbol):
                     filled = False
 
                     try:
-                        with _requests_lock:
+                        # ── REV 1.10.4 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='LIMIT',
                                 price=limit_price_adj, quantity=close_qty_str,
@@ -606,15 +621,15 @@ def manage_single_trade(symbol):
                             filled = True
                         else:
                             try:
-                                # REV 1.10.1 — A2-adjacent lock.
-                                with _requests_lock:
+                                # ── REV 1.10.4 — read probe then write cancel. ──
+                                with _read_lock:
                                     oo = client.futures_get_open_orders(
                                         symbol=pair
                                     )
                                 for o in oo:
                                     if o.get('type') == 'LIMIT' \
                                             and o.get('reduceOnly'):
-                                        with _requests_lock:
+                                        with _write_lock:
                                             client.futures_cancel_order(
                                                 symbol=pair,
                                                 orderId=o['orderId'],
@@ -631,7 +646,8 @@ def manage_single_trade(symbol):
                         )
 
                     if not filled:
-                        with _requests_lock:
+                        # ── REV 1.10.4 — write lock. ──
+                        with _write_lock:
                             client.futures_create_order(
                                 symbol=pair, side=close_side, type='MARKET',
                                 quantity=close_qty_str, reduceOnly=True,
@@ -657,15 +673,15 @@ def manage_single_trade(symbol):
 
                     # Cancel old STOPS so we can place a fresh BE
                     try:
-                        # REV 1.10.1 — A2-adjacent lock.
-                        with _requests_lock:
+                        # ── REV 1.10.4 — read probe then write cancels. ──
+                        with _read_lock:
                             oo = client.futures_get_open_orders(symbol=pair)
                         for o in oo:
                             otype = (o.get('type') or '').upper()
                             if 'STOP' in otype \
                                     and otype != 'TAKE_PROFIT_MARKET':
                                 try:
-                                    with _requests_lock:
+                                    with _write_lock:
                                         client.futures_cancel_order(
                                             symbol=pair,
                                             orderId=o['orderId'],
@@ -683,6 +699,8 @@ def manage_single_trade(symbol):
                             if 'STOP' in otype and 'TAKE_PROFIT' not in otype:
                                 oid = o.get('algoId') or o.get('orderId')
                                 if oid:
+                                    # _cancel_algo_order internally acquires
+                                    # _write_lock (REV 11.5) — no outer lock.
                                     _ca(pair, oid)
                     except Exception:
                         pass
@@ -716,7 +734,8 @@ def manage_single_trade(symbol):
                                     else entry * 0.9992
                                 )
                             be_adj = adjust_price(be_sl_tmp, tick)
-                            with _requests_lock:
+                            # ── REV 1.10.4 — write lock. ──
+                            with _write_lock:
                                 resp_be = client.futures_create_order(
                                     symbol=pair, side=close_side,
                                     type='STOP_MARKET',
@@ -837,7 +856,8 @@ def manage_single_trade(symbol):
                 refresh_timestamp()
 
                 def _place_new_sl():
-                    with _requests_lock:
+                    # ── REV 1.10.4 — write lock. ──
+                    with _write_lock:
                         return client.futures_create_order(
                             symbol=pair, side=close_side, type='STOP_MARKET',
                             stopPrice=new_sl_adj, quantity=cur_qty,
@@ -889,9 +909,17 @@ def manage_single_trade(symbol):
 
             except BinanceAPIException as e:
                 if e.code == -2021:
-                    logger.debug(
-                        f"[{symbol}] update_sl -2021 (stop crossed by "
-                        f"mark) — skipping update, will retry next cycle"
+                    # ── REV 1.10.3 — promoted DEBUG → WARNING. ──
+                    # The pre-check at the top of update_sl() guards
+                    # the common case, but mark can move between the
+                    # check and this create_order call. The OLD SL
+                    # stays live and valid — no safety gap. But a
+                    # burst of these means SL tightening is silently
+                    # failing; operators need visibility.
+                    logger.warning(
+                        f"[{symbol}] update_sl -2021 — mark crossed "
+                        f"new SL between pre-check and placement; "
+                        f"old SL remains active (will retry next cycle)"
                     )
                     return False
                 if handle_order_filter_error(pair, e):
@@ -1014,6 +1042,8 @@ def manage_single_trade(symbol):
 #  sync_existing_positions() has populated bot_tracked_symbols,
 #  the watch is silent (otherwise it fires CRITICAL on every real
 #  position during the ~100s startup window).
+#
+#  REV 1.10.4 — position probe under _read_lock (Phase 2 migration).
 # ═════════════════════════════════════════════════════════════
 _ORPHAN_SEEN: dict = {}
 
@@ -1036,7 +1066,8 @@ def _orphan_watch_tick(client=None):
     if client is None:
         return []
     try:
-        with _requests_lock:
+        # ── REV 1.10.4 — read lock. ──
+        with _read_lock:
             positions = client.futures_position_information()
     except Exception as e:
         logger.warning(f"[orphan-watch] position fetch failed: {e}")

@@ -1,6 +1,36 @@
 """
 orders/exit.py — Trade close and emergency close.
 
+REV 1.7.2 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 6):
+  ✅ Migrated all explicit `_requests_lock` sites to the explicit
+     read/write split introduced in core/client.py REV 11.5.
+
+     Classification applied:
+       • futures_position_information    → _read_lock
+       • futures_income_history          → _read_lock
+       • futures_get_open_orders         → _read_lock
+       • futures_create_order (MARKET)   → _write_lock
+       • futures_cancel_all_open_orders  → _write_lock
+       • futures_cancel_order            → _write_lock
+
+     Light restructure of robust_cancel_all():
+       Previously the entire mixed read/write sequence ran under one
+       outer _requests_lock. Under the split-lock regime that would
+       nest write→read (because _get_open_algo_orders internally takes
+       _read_lock while we hold _write_lock), which violates the
+       canonical lock ordering and invites future deadlock if any
+       code path ever introduces read→write nesting. The block is now
+       split into three distinct phases — cancel-all (write) → list
+       (read) + per-order cancel (write) → verify (read) — each phase
+       taking the correct lock for the shortest span. Behaviour is
+       unchanged: same calls, same order, same retries, same verify.
+
+     Effect: exit.py's read probes (position, income, order listing)
+     no longer serialise against order placements from entry.py /
+     repair.py. Writes still serialise against each other globally.
+
+     Zero behaviour change. Same lock semantics at each call site.
+
 REV 1.7.1 (2026-10-04) — DETERMINISTIC EMERGENCY-CLOSE CID (C4):
   ✅ CRITICAL: emergency_close_retry() now uses a DETERMINISTIC
      newClientOrderId derived from (pair, close_side, qty_str) via
@@ -37,7 +67,11 @@ from core.client import (
     fetch_position_raw, get_filters, adjust_qty,
     refresh_timestamp, _get_open_algo_orders, _cancel_algo_order,
     invalidate_account_cache, send_telegram, logger,
-    _requests_lock,
+    # ── REV 1.7.2 — explicit read/write locks (Phase 2). ──
+    # The legacy _requests_lock alias is no longer imported here on
+    # purpose: any missed migration site will raise a NameError at
+    # runtime rather than silently over-serialize.
+    _read_lock, _write_lock,
     handle_order_filter_error,   # REV 1.7.0
 )
 from core.config import CONFIG
@@ -142,6 +176,7 @@ def _emergency_close_success(symbol, pair):
 #  Emergency close retry loop
 #  REV 1.7.0 — rewritten
 #  REV 1.7.1 (C4) — deterministic cid per (pair, side, qty)
+#  REV 1.7.2 — read probes → _read_lock; MARKET close → _write_lock
 # ═════════════════════════════════════════════════════════════
 def emergency_close_retry(symbol, pair, close_side):
     """
@@ -171,7 +206,8 @@ def emergency_close_retry(symbol, pair, close_side):
     for attempt in range(max_attempts):
         try:
             refresh_timestamp()
-            with _requests_lock:
+            # ── REV 1.7.2 — read lock. ──
+            with _read_lock:
                 pos_arr = client.futures_position_information(symbol=pair)
 
             if not pos_arr:
@@ -194,7 +230,8 @@ def emergency_close_retry(symbol, pair, close_side):
 
             # ── Place the close ──
             try:
-                with _requests_lock:
+                # ── REV 1.7.2 — write lock. ──
+                with _write_lock:
                     client.futures_create_order(
                         symbol=pair, side=close_side, type='MARKET',
                         quantity=qty_str, reduceOnly=True,
@@ -255,7 +292,8 @@ def emergency_close_retry(symbol, pair, close_side):
                 # In either case, verify position before reacting.
                 if e.code == -2022:
                     try:
-                        with _requests_lock:
+                        # ── REV 1.7.2 — read lock. ──
+                        with _read_lock:
                             _chk = client.futures_position_information(
                                 symbol=pair
                             )
@@ -283,7 +321,8 @@ def emergency_close_retry(symbol, pair, close_side):
             for _ in range(4):
                 time.sleep(0.5 + random.uniform(0, 0.3))
                 try:
-                    with _requests_lock:
+                    # ── REV 1.7.2 — read lock. ──
+                    with _read_lock:
                         pos = client.futures_position_information(
                             symbol=pair
                         )[0]
@@ -321,6 +360,8 @@ def emergency_close_retry(symbol, pair, close_side):
 # ═════════════════════════════════════════════════════════════
 #  robust_cancel_all
 #  REV 1.7.0 — jitter + rate-limit awareness
+#  REV 1.7.2 — light restructure: split mixed-lock block into
+#              distinct read/write phases (canonical ordering).
 # ═════════════════════════════════════════════════════════════
 def robust_cancel_all(symbol_pair):
     client = _cl()
@@ -329,7 +370,11 @@ def robust_cancel_all(symbol_pair):
     for attempt in range(3):
         try:
             refresh_timestamp()
-            with _requests_lock:
+
+            # ── Phase 1: cancel all open orders (write) ──
+            # REV 1.7.2 — was inside a single mixed outer lock; the
+            # write portion is now scoped to _write_lock only.
+            with _write_lock:
                 try:
                     client.futures_cancel_all_open_orders(
                         symbol=symbol_pair
@@ -347,33 +392,39 @@ def robust_cancel_all(symbol_pair):
                 except Exception as e:
                     logger.debug(f"robust_cancel {symbol_pair}: {e}")
 
-                for o in _get_open_algo_orders(symbol_pair):
-                    oid = o.get('algoId') or o.get('orderId')
-                    if oid:
-                        _cancel_algo_order(symbol_pair, oid)
+            # ── Phase 2a: cancel algo orders (helpers self-lock). ──
+            for o in _get_open_algo_orders(symbol_pair):
+                oid = o.get('algoId') or o.get('orderId')
+                if oid:
+                    _cancel_algo_order(symbol_pair, oid)
 
-                try:
+            # ── Phase 2b: list open orders (read) then cancel each (write). ──
+            try:
+                with _read_lock:
                     open_orders = client.futures_get_open_orders(
                         symbol=symbol_pair
                     )
-                    for o in open_orders:
-                        try:
+                for o in open_orders:
+                    try:
+                        with _write_lock:
                             client.futures_cancel_order(
                                 symbol=symbol_pair, orderId=o['orderId']
                             )
-                        except Exception as _pe:
-                            logger.warning(f"[robust_cancel_all] ignored API error: {type(_pe).__name__}: {_pe}")
-                except Exception as _pe:
-                    logger.warning(f"[robust_cancel_all] ignored API error: {type(_pe).__name__}: {_pe}")
+                    except Exception as _pe:
+                        logger.warning(f"[robust_cancel_all] ignored API error: {type(_pe).__name__}: {_pe}")
+            except Exception as _pe:
+                logger.warning(f"[robust_cancel_all] ignored API error: {type(_pe).__name__}: {_pe}")
 
-                for o in _get_open_algo_orders(symbol_pair):
-                    oid = o.get('algoId') or o.get('orderId')
-                    if oid:
-                        _cancel_algo_order(symbol_pair, oid)
+            # ── Phase 2c: cancel algo orders again (same as 2a). ──
+            for o in _get_open_algo_orders(symbol_pair):
+                oid = o.get('algoId') or o.get('orderId')
+                if oid:
+                    _cancel_algo_order(symbol_pair, oid)
 
             time.sleep(0.3)
 
-            with _requests_lock:
+            # ── Phase 3: verify (read). ──
+            with _read_lock:
                 remaining = client.futures_get_open_orders(
                     symbol=symbol_pair
                 )
@@ -389,7 +440,8 @@ def robust_cancel_all(symbol_pair):
 
 # ═════════════════════════════════════════════════════════════
 #  get_total_pnl
-#  REV 1.7.0 — API call under _requests_lock
+#  REV 1.7.0 — API call under shared lock
+#  REV 1.7.2 — read → _read_lock
 # ═════════════════════════════════════════════════════════════
 def get_total_pnl(symbol, entry_time_ms):
     pair = symbol + 'USDT'
@@ -403,7 +455,8 @@ def get_total_pnl(symbol, entry_time_ms):
         refresh_timestamp()
         cursor = int(entry_time_ms)
         for _page in range(max_pages):
-            with _requests_lock:
+            # ── REV 1.7.2 — read lock. ──
+            with _read_lock:
                 income = client.futures_income_history(
                     symbol=pair, startTime=cursor, limit=page_size
                 )

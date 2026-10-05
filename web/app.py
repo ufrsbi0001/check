@@ -1,32 +1,37 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
-REV 1.5.6 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE:
-  ✅ `_normalize_position()` fallback now computes PnL from
-     `breakEvenPrice` (which includes entry commission), matching
-     what Binance Futures UI shows. Mirrors orders/utils.py REV 23.3.
-     Previously bot showed +$3.11 / +0.70% ROI vs Binance's
-     +$2.52 / +0.56% on the same 5× LTC tick.
-  ✅ Falls back to `entryPrice` when breakEvenPrice is missing.
-  ✅ Adds `break_even` field to the payload for UI/debug visibility.
+REV 1.5.7 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 7):
+  ✅ Migrated from the legacy `_requests_lock` (which aliases
+     _write_lock) to the explicit read/write split introduced in
+     core/client.py REV 11.5.
 
-REV 1.5.5 (2026-10-05) — LEVERAGE FALLBACK TO CONFIG:
-  ✅ `_normalize_position()` fallback now mirrors REV 23.2.1 in
-     orders/utils.py: if the exchange payload omits `leverage`
-     (Binance DEMO schema difference), fall back to
-     `config_center.leverage` instead of silently degrading to 1×.
+     Classification applied:
+       • _fetch_positions_cached()       → _read_lock
+         (futures_position_information is a read)
+       • api_close_position() first close → _write_lock
+       • api_close_position() retry close → _write_lock
 
-REV 1.5.4 (2026-10-05) — ROI % IN POSITION PAYLOAD.
-REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX.
-REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS.
-REV 1.5.1 (2026-10-03) — ERROR VISIBILITY + CACHING.
-REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING.
-REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING.
-REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API.
-REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION.
-REV 1.3.16 (2026-09-28) — DEAD-PROXY FALLOUT CLEANUP.
-REV 1.3.15 (2026-09-28) — MANUAL CLOSE FROM UI.
-REV 1.3.14 (2026-09-28) — DECISION ENGINE STATS EXPOSED.
+     The dashboard's position-fetch probe no longer serialises against
+     order placement from the trade manager. Its occasional MARKET
+     closes (manual user-initiated) correctly contend on _write_lock
+     with the rest of the order path.
+
+     Zero behaviour change. Same lock semantics at each call site.
+
+REV 1.5.6 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE (retained).
+REV 1.5.5 (2026-10-05) — LEVERAGE FALLBACK TO CONFIG (retained).
+REV 1.5.4 (2026-10-05) — ROI % IN POSITION PAYLOAD (retained).
+REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX (retained).
+REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS (retained).
+REV 1.5.1 (2026-10-03) — ERROR VISIBILITY + CACHING (retained).
+REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING (retained).
+REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING (retained).
+REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API (retained).
+REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION (retained).
+REV 1.3.16 (2026-09-28) — DEAD-PROXY FALLOUT CLEANUP (retained).
+REV 1.3.15 (2026-09-28) — MANUAL CLOSE FROM UI (retained).
+REV 1.3.14 (2026-09-28) — DECISION ENGINE STATS EXPOSED (retained).
 """
 
 from __future__ import annotations
@@ -247,8 +252,9 @@ def _fetch_positions_cached(client: Any) -> list:
                 now - _pos_cache["time"] < _POS_CACHE_TTL:
             return _pos_cache["data"]
 
+    # ── REV 1.5.7 — read lock (position fetch is a read). ──
     try:
-        from core.client import _requests_lock as _rl
+        from core.client import _read_lock as _rl
     except Exception:
         _rl = None
 
@@ -772,8 +778,9 @@ def api_close_position(symbol: str) -> Any:
     if abs(amt) <= 1e-9:
         return api_error(f"{sym_short} has no open position", 400)
 
+    # ── REV 1.5.7 — import write lock for the MARKET close path. ──
     try:
-        from core.client import get_filters, adjust_qty, _requests_lock
+        from core.client import get_filters, adjust_qty, _write_lock
         f = get_filters(pair)
         qty_str = adjust_qty(abs(amt), f["stepSize"], f["minQty"])
     except Exception as e:
@@ -784,7 +791,8 @@ def api_close_position(symbol: str) -> Any:
 
     order_id = None
     try:
-        with _requests_lock:
+        # ── REV 1.5.7 — write lock. ──
+        with _write_lock:
             resp = client.futures_create_order(
                 symbol=pair,
                 side=close_side,
@@ -811,7 +819,8 @@ def api_close_position(symbol: str) -> Any:
             settled = True
         else:
             add_log(f"⚠️ {sym_short} still {still} after first attempt — retrying")
-            with _requests_lock:
+            # ── REV 1.5.7 — write lock. ──
+            with _write_lock:
                 client.futures_create_order(
                     symbol=pair,
                     side=close_side,

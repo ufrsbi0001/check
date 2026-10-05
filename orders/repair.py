@@ -1,48 +1,39 @@
 """
 orders/repair.py — Reconciliation and order repair.
 
-REV 1.7.4 (2026-10-04) — ARM ORPHAN-WATCH AFTER STARTUP SYNC:
-  ✅ After the initial sync_existing_positions() completes and
-     bot_tracked_symbols reflects the exchange, call
-     orders.manage.mark_startup_sync_done(). This arms the orphan
-     watch that was previously firing false CRITICAL alerts during
-     the ~100s startup window (validate_symbols + first sync).
-     See orders/manage.py REV 1.10.2 for the corresponding guard.
-  ✅ Lazy import (inside the function) to avoid the module-load cycle:
-     manage.py imports from repair.py, so a top-level
-     `from .manage import ...` in repair.py would fail. By the time
-     this call runs, all modules are loaded — the import is safe.
-  ✅ If the import fails for any reason, we log a warning and continue.
-     The sync itself is still considered successful.
+REV 1.7.5 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 6):
+  ✅ Migrated all 20 explicit `_requests_lock` sites to the explicit
+     read/write split introduced in core/client.py REV 11.5.
 
-REV 1.7.3 (2026-10-04) — ADOPTED SL FROM CONFIG (Point 4):
-  ✅ _ADOPTED_FALLBACK_SL_PCT now read from
-     config_center.GLOBAL["adopted_fallback_sl_pct"] (env-tunable via
-     CC_ADOPTED_FALLBACK_SL_PCT or legacy ADOPTED_FALLBACK_SL_PCT).
-     Added local _cc_get_num() helper matching the pattern in
-     entry.py / manage.py / exit.py / future.py. Falls back to 0.02
-     if the key is missing. Zero behaviour change for the default.
-  ✅ Bounds enforced by config_center._validate(): [0.001, 0.10].
+     Classification applied:
+       READS (→ _read_lock):
+         • futures_get_order                    (SL id liveness)
+         • futures_get_algo_order               (SL id liveness)
+         • futures_get_open_orders              (multiple sites)
+         • futures_position_information         (multiple sites)
 
-REV 1.7.2 (2026-10-04) — CRITICAL ADOPTION + FAST-RECONCILE FIXES:
-  ✅ CRITICAL (C3): sync_existing_positions() now places an IMMEDIATE
-     protective STOP_MARKET with closePosition=true at the moment of
-     adoption — BEFORE registering the trade. Previously the orphan
-     was registered with a fallback initial_sl and the docstring
-     promised "will protect next cycle". Under API degradation "next
-     cycle" could be 30s+ during which the adopted position had NO
-     exchange-side stop. On -2021/-4005 (fallback would trigger
-     immediately), the orphan is emergency-closed rather than left
-     naked.
-  ✅ CRITICAL (C2): reconcile_active_trade() now uses a 10s fast-
-     reconcile window for `unverified` / `partial_fill` trades. The
-     previous 90s `_RECONCILE_SKIP_FRESH_SEC` window was meant for
-     fully-protected new trades; applying it to unverified trades left
-     naked risk unprotected for 90 seconds.
-  ✅ A2-adjacent: futures_get_open_orders calls in _repair_tps_if_missing
-     and cancel_all_sl_stops now hold _requests_lock (shared-session
-     safety, matching cancel_orphan_bot_orders).
+       WRITES (→ _write_lock):
+         • futures_cancel_order                 (SL cancel, orphan cancel)
+         • futures_create_order (STOP_MARKET)   (naked repair, adoption)
+         • futures_create_order (MARKET)        (crossed-TP close, -2021)
+         • futures_create_order (TAKE_PROFIT)   (TP repair + retry)
+         • futures_change_position_mode         (one-way mode force)
 
+     No lock sites were nested in the original file — every
+     `with _requests_lock:` block was self-contained and released
+     before the next one began. Migration is a straight primitive
+     swap; no restructure required.
+
+     Note: _get_open_algo_orders() and _cancel_algo_order() are called
+     from several sites here WITHOUT an outer lock — correct, since
+     both functions now acquire their own correct lock internally
+     (REV 11.5 in client.py).
+
+     Zero behaviour change. Same lock semantics at each call site.
+
+REV 1.7.4 (2026-10-04) — ARM ORPHAN-WATCH AFTER STARTUP SYNC (retained).
+REV 1.7.3 (2026-10-04) — ADOPTED SL FROM CONFIG (Point 4) (retained).
+REV 1.7.2 (2026-10-04) — CRITICAL ADOPTION + FAST-RECONCILE FIXES (retained).
 REV 1.7.1 (2026-10-03) — ADOPTED ORPHAN FALLBACK SL (retained).
 REV 1.7.0 (2026-10-03) — ORPHAN ADOPTION + FAIL-SAFE RECONCILE (retained).
 REV 1.6.1 (2026-10-03) — TP QTY NORMALIZATION FIX (retained).
@@ -62,7 +53,11 @@ from core.client import (
     get_filters, adjust_qty, adjust_price,
     refresh_timestamp, _get_open_algo_orders, _cancel_algo_order,
     _position_amt, send_telegram, logger,
-    _requests_lock,
+    # ── REV 1.7.5 — explicit read/write locks (Phase 2). ──
+    # The legacy _requests_lock alias is no longer imported here on
+    # purpose: any missed migration site will raise a NameError at
+    # runtime rather than silently over-serialize.
+    _read_lock, _write_lock,
     handle_order_filter_error,
 )
 from core.state import (
@@ -144,7 +139,8 @@ def _sl_id_is_live(client, pair: str, sl_id) -> bool:
     if not sl_id:
         return False
     try:
-        with _requests_lock:
+        # ── REV 1.7.5 — read lock. ──
+        with _read_lock:
             o = client.futures_get_order(symbol=pair, orderId=sl_id)
         if o and (o.get('status') or '').upper() in ('NEW', 'PARTIALLY_FILLED'):
             return True
@@ -157,7 +153,8 @@ def _sl_id_is_live(client, pair: str, sl_id) -> bool:
     try:
         q = getattr(client, 'futures_get_algo_order', None)
         if callable(q):
-            with _requests_lock:
+            # ── REV 1.7.5 — read lock. ──
+            with _read_lock:
                 o = q(symbol=pair, algoId=sl_id)
             if o and (o.get('status') or o.get('algoStatus') or '').upper() \
                     in ('NEW', 'PARTIALLY_FILLED', 'WORKING'):
@@ -176,7 +173,8 @@ def _sl_id_query_succeeded(client, pair: str, sl_id) -> bool:
         return True
 
     try:
-        with _requests_lock:
+        # ── REV 1.7.5 — read lock. ──
+        with _read_lock:
             client.futures_get_order(symbol=pair, orderId=sl_id)
     except BinanceAPIException as e:
         if e.code in (-2011, -2013):
@@ -199,7 +197,8 @@ def cancel_specific_sl(pair, sl_id):
     for attempt in range(3):
         try:
             refresh_timestamp()
-            with _requests_lock:
+            # ── REV 1.7.5 — write lock. ──
+            with _write_lock:
                 client.futures_cancel_order(symbol=pair, orderId=sl_id)
             logger.info(f"[{pair}] Cancelled specific SL {sl_id}")
             return True
@@ -250,8 +249,8 @@ def cancel_all_sl_stops(pair, except_ids=None):
     try:
         refresh_timestamp()
         try:
-            # REV 1.7.2 — A2-adjacent: hold shared-session lock.
-            with _requests_lock:
+            # ── REV 1.7.5 — read lock. ──
+            with _read_lock:
                 open_orders = client.futures_get_open_orders(symbol=pair)
         except Exception:
             open_orders = []
@@ -263,7 +262,8 @@ def cancel_all_sl_stops(pair, except_ids=None):
                 otype = (o.get('type') or '').upper()
                 if otype in ('STOP', 'STOP_MARKET', 'TRAILING_STOP_MARKET') \
                         and o.get('reduceOnly'):
-                    with _requests_lock:
+                    # ── REV 1.7.5 — write lock. ──
+                    with _write_lock:
                         client.futures_cancel_order(symbol=pair, orderId=oid)
             except Exception as _pe:
                 logger.warning(f"[cancel_all_sl_stops] ignored API error: {type(_pe).__name__}: {_pe}")
@@ -319,7 +319,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
 
     mark = 0.0
     try:
-        with _requests_lock:
+        # ── REV 1.7.5 — read lock. ──
+        with _read_lock:
             pos_list = client.futures_position_information(symbol=pair)
         if pos_list:
             mark = float(pos_list[0].get('markPrice') or 0)
@@ -328,8 +329,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
 
     existing_tps = set()
     try:
-        # REV 1.7.2 — A2-adjacent: hold shared-session lock.
-        with _requests_lock:
+        # ── REV 1.7.5 — read lock. ──
+        with _read_lock:
             _open_orders_tp = client.futures_get_open_orders(symbol=pair)
         for o in _open_orders_tp:
             t = (o.get('type') or '').upper()
@@ -440,7 +441,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
                         f"by market (mark {mark:.6f}) — MARKET-CLOSING "
                         f"{close_qty_dec}"
                     )
-                    with _requests_lock:
+                    # ── REV 1.7.5 — write lock. ──
+                    with _write_lock:
                         resp = client.futures_create_order(
                             symbol=pair, side=close_side, type='MARKET',
                             quantity=format(close_qty_dec, f'.{prec}f'),
@@ -491,7 +493,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
 
         slot_cid = f"tb_repair_{label.lower()}_{pair}"
         try:
-            with _requests_lock:
+            # ── REV 1.7.5 — write lock. ──
+            with _write_lock:
                 resp = client.futures_create_order(
                     symbol=pair, side=close_side, type='TAKE_PROFIT_MARKET',
                     stopPrice=adj, quantity=tp_qty_str, reduceOnly=True,
@@ -514,7 +517,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
                 try:
                     f2 = get_filters(pair)
                     adj2 = adjust_price(tp_price, f2['tickSize'])
-                    with _requests_lock:
+                    # ── REV 1.7.5 — write lock. ──
+                    with _write_lock:
                         resp = client.futures_create_order(
                             symbol=pair, side=close_side,
                             type='TAKE_PROFIT_MARKET',
@@ -544,7 +548,8 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
                     if close_qty_dec < min_qty:
                         close_qty_dec = min_qty
 
-                    with _requests_lock:
+                    # ── REV 1.7.5 — write lock. ──
+                    with _write_lock:
                         client.futures_create_order(
                             symbol=pair, side=close_side, type='MARKET',
                             quantity=format(close_qty_dec, f'.{prec}f'),
@@ -649,7 +654,8 @@ def reconcile_active_trade(symbol):
                 client = _cl()
                 if client is None:
                     return
-                with _requests_lock:
+                # ── REV 1.7.5 — write lock. ──
+                with _write_lock:
                     resp = client.futures_create_order(
                         symbol=pair, side=close_side, type='STOP_MARKET',
                         stopPrice=stop, quantity=qty, reduceOnly=True,
@@ -684,7 +690,8 @@ def reconcile_active_trade(symbol):
                         qty2 = adjust_qty(
                             abs(cur_amt), f2['stepSize'], f2['minQty']
                         )
-                        with _requests_lock:
+                        # ── REV 1.7.5 — write lock. ──
+                        with _write_lock:
                             resp = client.futures_create_order(
                                 symbol=pair, side=close_side,
                                 type='STOP_MARKET',
@@ -809,7 +816,8 @@ def cancel_orphan_bot_orders(symbol_pair, force=False):
     cancelled = 0
     try:
         refresh_timestamp()
-        with _requests_lock:
+        # ── REV 1.7.5 — read lock. ──
+        with _read_lock:
             open_orders = client.futures_get_open_orders(symbol=symbol_pair)
         for o in open_orders:
             otype = o.get('type', '')
@@ -821,7 +829,8 @@ def cancel_orphan_bot_orders(symbol_pair, force=False):
             if not is_bot_order:
                 continue
             try:
-                with _requests_lock:
+                # ── REV 1.7.5 — write lock. ──
+                with _write_lock:
                     client.futures_cancel_order(
                         symbol=symbol_pair, orderId=o['orderId']
                     )
@@ -884,7 +893,8 @@ def sync_existing_positions():
         for attempt in range(3):
             try:
                 refresh_timestamp()
-                with _requests_lock:
+                # ── REV 1.7.5 — read lock. ──
+                with _read_lock:
                     positions = client.futures_position_information()
                 break
             except Exception as e:
@@ -947,7 +957,8 @@ def sync_existing_positions():
                         # closePosition=true is the ONLY stop type that
                         # survives qty drift / partial fills and can
                         # never be oversize/undersize.
-                        with _requests_lock:
+                        # ── REV 1.7.5 — write lock. ──
+                        with _write_lock:
                             resp = client.futures_create_order(
                                 symbol=_pair,
                                 side=close_side,
@@ -1100,7 +1111,8 @@ def clean_orders():
     for attempt in range(3):
         try:
             refresh_timestamp()
-            with _requests_lock:
+            # ── REV 1.7.5 — read lock. ──
+            with _read_lock:
                 positions = client.futures_position_information()
             break
         except Exception as e:
@@ -1131,7 +1143,8 @@ def clean_orders():
         cancel_orphan_bot_orders(sym, force=True)
 
     try:
-        with _requests_lock:
+        # ── REV 1.7.5 — write lock (change_position_mode mutates account state). ──
+        with _write_lock:
             client.futures_change_position_mode(dualSidePosition=False)
         logger.info(" One-Way Mode")
     except Exception as e:

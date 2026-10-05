@@ -9,51 +9,46 @@ endpoints for accurate UI display.
 Data is refreshed by a background worker every 5 minutes.
 Uses bot's existing Binance client (no extra session).
 
-REV 1.9 (2026-10-03) — SHARED-SESSION SAFETY:
-  ✅ All Binance API calls now serialised under core.client's
-     _requests_lock. The python-binance Client's requests.Session is
-     NOT thread-safe (cookie jar, connection-pool bookkeeping), and
-     analytics previously called futures_income_history /
-     futures_account_trades / futures_get_all_orders WITHOUT the lock
-     — mixed with the trading engine's own locked calls on the same
-     session. Under sustained load this produced intermittent
-     TimeoutError / corrupted HTTP state (the empty "Balance fetch
-     error:" messages in the demo logs were a downstream symptom).
-     The lock is taken PER API CALL (not per pagination loop), so
-     the trading engine's order path can interleave between pages.
-     Expected impact: analytics refresh slows ~10-20% (already ~45s);
-     the trading engine is never blocked for the full refresh.
-  ✅ Defensive import of _requests_lock — if a future/old client.py
-     doesn't expose it, a local RLock is used so analytics still
+REV 1.10 (2026-10-05) — READ-LOCK MIGRATION (Phase 2, Step 7):
+  ✅ Migrated from the legacy `_requests_lock` (which aliases
+     _write_lock) to the explicit `_read_lock` introduced in
+     core/client.py REV 11.5. EVERY Binance call in this module is
+     a read:
+       • futures_income_history      (probe + pagination + fallback)
+       • futures_account_trades      (fills)
+       • futures_get_all_orders      (orders)
+     All 5 call sites are read-lock; there is no order placement in
+     analytics.
+  ✅ Defensive import retained: if a future/old client.py doesn't
+     expose `_read_lock`, a local RLock is used so analytics still
      works (just not coordinated with the trading engine).
+  ✅ Shared-session-safety rationale unchanged: python-binance's
+     requests.Session is not thread-safe; every read still serialises
+     under a shared lock. It's just now the read-specific lock, so
+     the trading engine's WRITE path (order placement, SL update)
+     no longer waits behind an analytics refresh.
 
-REV 1.8 (2026-10-03) — PERF + CONFIG + ROBUSTNESS:
-  ✅ FIXED: _summarize_trade() was O(trades × income). For every trade
-     it linearly scanned ALL income rows to find matching FUNDING_FEE
-     events — 5000 trades × 10000 income = 50M iterations per refresh.
-     Now a per-symbol funding index is built once and reused, reducing
-     to O(income + trades × per_symbol_funding). Typical speedup:
-     5-10× on accounts with heavy funding history.
-  ✅ PAGE_SIZE now sourced from CONFIG.income_page_size (was a
-     hardcoded 1000 constant duplicating the value). Same default,
-     but a single source of truth — set CC_INCOME_PAGE_SIZE to tune.
-  ✅ MAX_PAGES retained as an analytics-specific safety ceiling (500).
-  ✅ FIXED: _fetch_fills() / _fetch_orders() — `int(resp[-1]["id"])`
-     could raise KeyError/ValueError on malformed API responses
-     (defensive parsing added).
-  ✅ refresh_now() logs at DEBUG when the non-blocking refresh lock
-     is already held.
-  ✅ INCOME_LOOKBACK_DAYS comment clarified: 89 is Binance's protocol
-     cap (retention limit), NOT a user-tunable preference.
+     Expected impact: analytics refresh throughput unchanged; the
+     trading engine's order path is no longer blocked by income /
+     fills / orders pagination bursts. That was the whole point of
+     the split.
 
-REV 1.7 (2026-09-28) — FALLBACK LOOP CONSISTENCY FIX.
-REV 1.6 (2026-09-28) — SILENT CLIENT-WAIT FOR WORKER.
-REV 1.5 (2026-09-26) — FILLS/ORDERS RATE-LIMIT PAGE-SKIP FIX.
-REV 1.4 (2026-09-26) — PAGINATION ROBUSTNESS.
-REV 1.3 (2026-09-26) — ALIGNED WITH history.py REV 3.7.
-REV 1.2 (2026-09-26) — aligned with history.py REV 3.3.
-REV 1.1 (2026-09-24) — double-fetch fix.
-REV 1.0 (2026-09-24) — initial release.
+REV 1.9 (2026-10-03) — SHARED-SESSION SAFETY (retained):
+  ✅ All Binance API calls now serialised under a shared lock. The
+     python-binance Client's requests.Session is NOT thread-safe.
+     Under sustained load this produced intermittent TimeoutError /
+     corrupted HTTP state.
+  ✅ Lock taken PER API CALL (not per pagination loop).
+
+REV 1.8 (2026-10-03) — PERF + CONFIG + ROBUSTNESS (retained).
+REV 1.7 (2026-09-28) — FALLBACK LOOP CONSISTENCY FIX (retained).
+REV 1.6 (2026-09-28) — SILENT CLIENT-WAIT FOR WORKER (retained).
+REV 1.5 (2026-09-26) — FILLS/ORDERS RATE-LIMIT PAGE-SKIP FIX (retained).
+REV 1.4 (2026-09-26) — PAGINATION ROBUSTNESS (retained).
+REV 1.3 (2026-09-26) — ALIGNED WITH history.py REV 3.7 (retained).
+REV 1.2 (2026-09-26) — aligned with history.py REV 3.3 (retained).
+REV 1.1 (2026-09-24) — double-fetch fix (retained).
+REV 1.0 (2026-09-24) — initial release (retained).
 """
 from __future__ import annotations
 
@@ -66,16 +61,16 @@ from typing import Any, Optional
 from core.config import CONFIG
 from core.client import get_client, logger
 
-# ── REV 1.9 — shared _requests_lock (defensive import) ──
+# ── REV 1.10 — shared _read_lock (defensive import) ──
+# Every Binance call in this module is a READ. Prefer the explicit
+# _read_lock from client.py REV 11.5. Fall back to a local RLock on
+# older clients (analytics still works, just not coordinated).
 try:
-    from core.client import _requests_lock
+    from core.client import _read_lock
 except ImportError:
-    # Older/unknown client.py — fall back to a local lock. Analytics
-    # still works, just not coordinated with the trading engine's own
-    # session use. Log once so operators know the fix isn't active.
-    _requests_lock = threading.RLock()
+    _read_lock = threading.RLock()
     logger.warning(
-        "[analytics] core.client._requests_lock not available — "
+        "[analytics] core.client._read_lock not available — "
         "using local lock; shared-session coordination DISABLED"
     )
 
@@ -177,7 +172,7 @@ def _safe_int(v: Any, default: int = 0) -> int:
 
 
 # ═════════════════════════════════════════════════════════════
-#  PAGE-SUPPORT PROBE  (REV 1.3, revised REV 1.4 / 1.9)
+#  PAGE-SUPPORT PROBE  (REV 1.3, revised REV 1.4 / 1.9 / 1.10)
 # ═════════════════════════════════════════════════════════════
 def _probe_page_support(client) -> bool:
     """
@@ -190,8 +185,7 @@ def _probe_page_support(client) -> bool:
     The runtime auto-fallback in _fetch_income_window() is the real
     safety net.
 
-    REV 1.9 — wrapped in _requests_lock to serialise with the trading
-    engine's own shared-session use.
+    REV 1.10 — read lock.
     """
     global _PAGE_SUPPORT_CACHE
     if _PAGE_SUPPORT_CACHE is not None:
@@ -199,7 +193,8 @@ def _probe_page_support(client) -> bool:
 
     now_ms = int(time.time() * 1000)
     try:
-        with _requests_lock:
+        # ── REV 1.10 — read lock. ──
+        with _read_lock:
             client.futures_income_history(
                 startTime=now_ms - 24 * 60 * 60 * 1000,
                 endTime=now_ms,
@@ -226,7 +221,7 @@ def _fetch_fills(client, symbol: str) -> list[dict]:
 
     REV 1.5 — RATE-LIMIT RETRY FIX.
     REV 1.8 — defensive int() on last id.
-    REV 1.9 — API call wrapped in _requests_lock.
+    REV 1.10 — read lock.
     """
     out: list[dict] = []
     from_id = 0
@@ -235,7 +230,8 @@ def _fetch_fills(client, symbol: str) -> list[dict]:
 
     while page < MAX_PAGES:
         try:
-            with _requests_lock:
+            # ── REV 1.10 — read lock. ──
+            with _read_lock:
                 resp = client.futures_account_trades(
                     symbol=symbol, limit=PAGE_SIZE, fromId=from_id,
                 )
@@ -284,7 +280,7 @@ def _fetch_orders(client, symbol: str, from_order_id: int) -> list[dict]:
 
     REV 1.5 — same rate-limit retry fix as _fetch_fills().
     REV 1.8 — defensive int() on last orderId.
-    REV 1.9 — API call wrapped in _requests_lock.
+    REV 1.10 — read lock.
     """
     out: list[dict] = []
     from_id = from_order_id
@@ -293,7 +289,8 @@ def _fetch_orders(client, symbol: str, from_order_id: int) -> list[dict]:
 
     while page < MAX_PAGES:
         try:
-            with _requests_lock:
+            # ── REV 1.10 — read lock. ──
+            with _read_lock:
                 resp = client.futures_get_all_orders(
                     symbol=symbol, limit=PAGE_SIZE, fromId=from_id,
                 )
@@ -349,7 +346,7 @@ def _fetch_income_window(client, start_ms: int, end_ms: int,
       • Bail after MAX_CONSECUTIVE_RL consecutive rate limits.
 
     REV 1.5: hardcoded 1000 → PAGE_SIZE.
-    REV 1.9: API call wrapped in _requests_lock.
+    REV 1.10: read lock.
     """
     out: list[dict] = []
     seen_keys: set = set()
@@ -358,7 +355,8 @@ def _fetch_income_window(client, start_ms: int, end_ms: int,
 
     while page < max_pages:
         try:
-            with _requests_lock:
+            # ── REV 1.10 — read lock. ──
+            with _read_lock:
                 batch = client.futures_income_history(
                     startTime=start_ms, endTime=end_ms,
                     limit=PAGE_SIZE, page=page,
@@ -429,7 +427,7 @@ def _fetch_income_window_fallback(client, start_ms: int,
 
     REV 1.5: hardcoded 1000 → PAGE_SIZE.
     REV 1.7 — RATE-LIMIT PAGE-COUNTER FIX.
-    REV 1.9 — API call wrapped in _requests_lock.
+    REV 1.10 — read lock.
     """
     out: list[dict] = []
     seen_keys: set = set()
@@ -440,7 +438,8 @@ def _fetch_income_window_fallback(client, start_ms: int,
 
     while page < MAX_PAGES:
         try:
-            with _requests_lock:
+            # ── REV 1.10 — read lock. ──
+            with _read_lock:
                 batch = client.futures_income_history(
                     startTime=cursor, endTime=end_ms, limit=PAGE_SIZE,
                 )

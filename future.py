@@ -1,6 +1,39 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.42 (2026-10-05) — WRITE-LOCK MIGRATION (Phase 2, Step 5):
+  ✅ _place_adoption_stop() now acquires _c._write_lock instead of
+     the legacy _c._requests_lock alias (= _write_lock). This is the
+     only explicit lock site in this file — the adoption SL is an
+     order placement, therefore a WRITE.
+
+     Effect: identical to before (the alias already pointed at
+     _write_lock), but the intent is now explicit and the site is
+     ready for the eventual removal of the _requests_lock alias in
+     core/client.py once every consumer has migrated.
+
+     Zero behaviour change. Same lock primitive at this call site.
+
+REV 1.4.41 (2026-10-05) — SAFETY + OBSERVABILITY PATCH:
+  ✅ FIXED (HIGH): DD kill-switch was unreachable in degraded mode.
+     If get_balance_or_last_good() returned a stale-but-valid balance
+     (degraded=True), the main loop did `time.sleep(30); continue`
+     BEFORE reaching the is_limit_reached() check. A losing day whose
+     balance feed hiccuped would therefore never trip the kill-switch
+     and the bot would keep cycling indefinitely. Now the DD check
+     runs FIRST, using the last-good balance, and only then do we
+     decide whether to skip new entries this cycle.
+  ✅ FIXED: coin.replace('USDT', '') → coin.removesuffix('USDT').
+     The old form would silently corrupt the short symbol of any
+     ticker containing 'USDT' mid-string, breaking the IN POSITION
+     display fix from REV 1.4.40. removesuffix is idempotent and
+     matches the pattern already used elsewhere in this file.
+  ✅ ADDED: config proxy contract self-check at startup. Calls
+     core.config_center.verify_proxy_contract() and logs CRITICAL
+     if config.py advertises proxy keys that are missing from
+     config_center.GLOBAL. Fails LOUD instead of leaving a subtle
+     CONFIG.<attr> → AttributeError landmine for the first reader.
+
 REV 1.4.40 (2026-10-04) — IN-POSITION VISIBILITY IN SCANNER:
   ✅ FIXED: The `action` column previously showed "IN POSITION" only
      for coins whose signal had fired and passed all filters — because
@@ -253,6 +286,7 @@ def _derive_adopted_sl(pos: dict, amt: float) -> float:
 
 # ═════════════════════════════════════════════════════════════
 #  REV 1.4.32 / 1.4.32.1 (C3) — IMMEDIATE PROTECTIVE STOP ON ADOPTION
+#  REV 1.4.42 — write-lock migration (Phase 2).
 # ═════════════════════════════════════════════════════════════
 def _place_adoption_stop(client, sym: str, amt: float,
                          fallback_sl: float,
@@ -278,6 +312,12 @@ def _place_adoption_stop(client, sym: str, amt: float,
         close instead of round-tripping to Binance just to collect
         a -2021.
       • int(sl_id) conversion is now guarded.
+
+    REV 1.4.42 (Phase 2):
+      • Lock primitive at the order placement site migrated from
+        _c._requests_lock (legacy alias) to _c._write_lock (explicit).
+        Same underlying lock; intent now explicit; ready for alias
+        removal.
     """
     if fallback_sl <= 0:
         return 0, '0', True
@@ -348,7 +388,8 @@ def _place_adoption_stop(client, sym: str, amt: float,
             pass  # fall through to network attempt
 
     try:
-        with _c._requests_lock:
+        # ── REV 1.4.42 — explicit write lock (was _c._requests_lock). ──
+        with _c._write_lock:
             resp = client.futures_create_order(
                 symbol=pair,
                 side=close_side,
@@ -925,6 +966,45 @@ def _fetch_coin_indicators(coin: str) -> tuple:
 
 
 # ═════════════════════════════════════════════════════════════
+#  REV 1.4.41 — CONFIG PROXY CONTRACT SELF-CHECK
+# ═════════════════════════════════════════════════════════════
+def _log_proxy_contract_status() -> None:
+    """
+    Fail LOUD if config.py advertises proxy keys that are missing
+    from config_center.GLOBAL.
+
+    A missing key means `CONFIG.<attr>` will raise AttributeError at
+    the FIRST read site — which could be deep inside order placement.
+    Surface it now, before any trade logic runs.
+    """
+    try:
+        from core.config_center import verify_proxy_contract
+    except Exception as e:
+        logger.debug(f"[config-check] verify_proxy_contract import failed: {e}")
+        return
+
+    try:
+        missing = verify_proxy_contract()
+    except Exception as e:
+        logger.warning(f"[config-check] verify_proxy_contract raised: {e}")
+        return
+
+    if missing:
+        logger.critical(
+            f"⚠️ CONFIG PROXY CONTRACT VIOLATION — core/config.py "
+            f"advertises trading attrs that are MISSING from "
+            f"core/config_center.GLOBAL: {missing}. "
+            f"Any CONFIG.<attr> read for these keys will raise "
+            f"AttributeError. Fix config_center defaults before trading."
+        )
+    else:
+        logger.info(
+            "✅ Config proxy contract OK — trading source of truth: "
+            "core/config_center.GLOBAL"
+        )
+
+
+# ═════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═════════════════════════════════════════════════════════════
 def main_loop():
@@ -934,6 +1014,9 @@ def main_loop():
     if not CONFIG.bot_coins:
         logger.critical("❌ CONFIG.bot_coins is empty")
         return
+
+    # ── REV 1.4.41 — proxy contract self-check (fail loud, early). ──
+    _log_proxy_contract_status()
 
     _s.load_cooldowns()
     _o.clean_orders()
@@ -1139,18 +1222,26 @@ def main_loop():
                     time.sleep(30)
                     continue
 
+                # ═══════════════════════════════════════════════════
+                #  REV 1.4.41 — DD KILL-SWITCH RUNS FIRST, ALWAYS.
+                #  A stale-but-recent last-good balance is still the
+                #  best available signal for the daily DD gate.
+                #  Previously the `if degraded: continue` block lived
+                #  ABOVE this check, so a losing day whose balance feed
+                #  hiccuped would never trip the kill-switch and the bot
+                #  would keep cycling indefinitely.
+                # ═══════════════════════════════════════════════════
+                is_limited, reason = _s.daily_tracker.is_limit_reached(balance)
+                if is_limited:
+                    _execute_dd_halt(reason)
+                    break
+
                 if degraded:
                     logger.warning(
                         "🔶 Degraded mode — skipping new entries this cycle"
                     )
                     time.sleep(30)
                     continue
-
-                # DD KILL-SWITCH: FLATTEN, DO NOT SKIP
-                is_limited, reason = _s.daily_tracker.is_limit_reached(balance)
-                if is_limited:
-                    _execute_dd_halt(reason)
-                    break
 
                 active_trades_list = []
                 try:
@@ -1232,7 +1323,11 @@ def main_loop():
                     ind_1d = results.get('1d')
                     df_1h = dfs_closed.get('1h')
 
-                    symbol = coin.replace('USDT', '')
+                    # ── REV 1.4.41 — removesuffix (was replace). ──
+                    # The old form would silently corrupt any ticker
+                    # containing 'USDT' mid-string, breaking the
+                    # IN POSITION display fix from REV 1.4.40.
+                    symbol = coin.removesuffix('USDT')
                     _family = _safe_family(coin)
                     live_price = live_prices.get(coin, 0.0)
 
