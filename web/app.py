@@ -1,37 +1,50 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
-REV 1.5.7 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 7):
-  ✅ Migrated from the legacy `_requests_lock` (which aliases
-     _write_lock) to the explicit read/write split introduced in
-     core/client.py REV 11.5.
+REV 1.5.8 (2026-10-05) — COMPLETE READ-LOCK COVERAGE:
+  ✅ Closed the remaining unlocked Binance call sites from the
+     REV 1.5.7 migration. The session is NOT thread-safe (per the
+     rationale in analytics.py REV 1.9 / client.py REV 11.5), so
+     EVERY network call — read or write — must serialise on the
+     appropriate lock. Previously these five sites were naked:
 
-     Classification applied:
-       • _fetch_positions_cached()       → _read_lock
-         (futures_position_information is a read)
-       • api_close_position() first close → _write_lock
-       • api_close_position() retry close → _write_lock
+       • _fetch_balance()              → futures_account()
+       • _resolve_sl_price()           → futures_get_open_orders()
+       • api_close_position() pre-check → futures_position_information()
+       • api_close_position() settle 1  → futures_position_information()
+       • api_close_position() settle 2  → futures_position_information()
+       • _paginate_income()            → futures_income_history()
+       • _paginate_fills()             → futures_account_trades()
 
-     The dashboard's position-fetch probe no longer serialises against
-     order placement from the trade manager. Its occasional MARKET
-     closes (manual user-initiated) correctly contend on _write_lock
-     with the rest of the order path.
+     All are READS except the two futures_create_order() calls in
+     api_close_position(), which already use _write_lock.
 
-     Zero behaviour change. Same lock semantics at each call site.
+  ✅ Module-level import of _read_lock / _write_lock with a local
+     RLock fallback (same defensive pattern as analytics.py REV 1.10).
+     Removes the per-call local imports that duplicated the same
+     try/except dance in three places.
 
-REV 1.5.6 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE (retained).
-REV 1.5.5 (2026-10-05) — LEVERAGE FALLBACK TO CONFIG (retained).
-REV 1.5.4 (2026-10-05) — ROI % IN POSITION PAYLOAD (retained).
-REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX (retained).
-REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS (retained).
-REV 1.5.1 (2026-10-03) — ERROR VISIBILITY + CACHING (retained).
-REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING (retained).
-REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING (retained).
-REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API (retained).
-REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION (retained).
-REV 1.3.16 (2026-09-28) — DEAD-PROXY FALLOUT CLEANUP (retained).
-REV 1.3.15 (2026-09-28) — MANUAL CLOSE FROM UI (retained).
-REV 1.3.14 (2026-09-28) — DECISION ENGINE STATS EXPOSED (retained).
+  ✅ _fetch_positions_cached() simplified — now uses the module-level
+     _read_lock instead of a per-call local import.
+
+  ✅ Zero behaviour change on the happy path. Same lock semantics,
+     same serialisation discipline, just applied consistently.
+
+REV 1.5.7 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 7)
+  (retained — see history).
+REV 1.5.6 — BINANCE UI PARITY VIA BREAK-EVEN PRICE (retained).
+REV 1.5.5 — LEVERAGE FALLBACK TO CONFIG (retained).
+REV 1.5.4 — ROI % IN POSITION PAYLOAD (retained).
+REV 1.5.3 — TRADE-MANAGER LIFECYCLE FIX (retained).
+REV 1.5.2 — RATE-LIMIT RELAXATION FOR READS (retained).
+REV 1.5.1 — ERROR VISIBILITY + CACHING (retained).
+REV 1.5.0 — DEFENSIVE HARDENING (retained).
+REV 1.4.2 — DAILY LOSS DASHBOARD WIRING (retained).
+REV 1.4.1 — TIME_EXIT TOGGLE API (retained).
+REV 1.4.0 — PHASE 4 WEB MIGRATION (retained).
+REV 1.3.16 — DEAD-PROXY FALLOUT CLEANUP (retained).
+REV 1.3.15 — MANUAL CLOSE FROM UI (retained).
+REV 1.3.14 — DECISION ENGINE STATS EXPOSED (retained).
 """
 
 from __future__ import annotations
@@ -60,6 +73,23 @@ LOG_PREFIX_IDLE = "⏳ System idle. Waiting for API keys."
 
 _MAX_HOLD_MINUTES = 1440
 _POS_CACHE_TTL = 3.0
+
+
+# ─────────────────────────────────────────────────────────────
+# SHARED-SESSION LOCKS (REV 1.5.8)
+#   python-binance's requests.Session is NOT thread-safe.
+#   Every network call — read or write — must serialise on the
+#   appropriate lock. _read_lock is shared by every read; _write_lock
+#   serialises order placement / SL updates with the trading engine.
+#   Falls back to local RLocks on older clients (app still works,
+#   just not coordinated with the engine).
+# ─────────────────────────────────────────────────────────────
+try:
+    from core.client import _read_lock, _write_lock
+except ImportError:
+    _read_lock = threading.RLock()
+    _write_lock = threading.RLock()
+    # logger not built yet — defer warning until after _build_logger().
 
 
 # ─────────────────────────────────────────────────────────────
@@ -95,6 +125,18 @@ if sys.platform == "win32":
         pass
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+
+# ── REV 1.5.8 — warn once if locks fell back to local RLocks. ──
+try:
+    from core.client import _read_lock as _probe_rl  # noqa: F401
+    _LOCKS_NATIVE = True
+except ImportError:
+    _LOCKS_NATIVE = False
+    log.warning(
+        "[app] core.client locks unavailable — using local RLocks; "
+        "shared-session coordination with trading engine DISABLED"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -252,16 +294,8 @@ def _fetch_positions_cached(client: Any) -> list:
                 now - _pos_cache["time"] < _POS_CACHE_TTL:
             return _pos_cache["data"]
 
-    # ── REV 1.5.7 — read lock (position fetch is a read). ──
-    try:
-        from core.client import _read_lock as _rl
-    except Exception:
-        _rl = None
-
-    if _rl is not None:
-        with _rl:
-            data = client.futures_position_information()
-    else:
+    # ── REV 1.5.8 — module-level _read_lock (position fetch is a read). ──
+    with _read_lock:
         data = client.futures_position_information()
 
     with _pos_cache_lock:
@@ -378,14 +412,18 @@ def bot_runner() -> None:
 # STATUS FETCHER
 # ─────────────────────────────────────────────────────────────
 def _fetch_balance(client: Any) -> float:
-    acc = client.futures_account()
+    # ── REV 1.5.8 — read lock. ──
+    with _read_lock:
+        acc = client.futures_account()
     return float(acc["totalWalletBalance"]) + float(acc.get("totalUnrealizedProfit", 0))
 
 
 def _resolve_sl_price(client: Any, symbol_pair: str) -> float:
     """Best-effort stop-loss price from open protective stop orders."""
     try:
-        orders = client.futures_get_open_orders(symbol=symbol_pair)
+        # ── REV 1.5.8 — read lock. ──
+        with _read_lock:
+            orders = client.futures_get_open_orders(symbol=symbol_pair)
     except Exception as e:
         log.debug(f"_resolve_sl_price {symbol_pair}: {type(e).__name__}: {e}")
         return 0.0
@@ -761,7 +799,9 @@ def api_close_position(symbol: str) -> Any:
 
     try:
         _refresh_timestamp()
-        pos_arr = client.futures_position_information(symbol=pair)
+        # ── REV 1.5.8 — read lock. ──
+        with _read_lock:
+            pos_arr = client.futures_position_information(symbol=pair)
     except Exception as e:
         log.exception(f"[close_position] position fetch failed for {pair}")
         return api_error(f"Position fetch failed: {type(e).__name__}: {_safe_err(e)}", 500)
@@ -778,9 +818,8 @@ def api_close_position(symbol: str) -> Any:
     if abs(amt) <= 1e-9:
         return api_error(f"{sym_short} has no open position", 400)
 
-    # ── REV 1.5.7 — import write lock for the MARKET close path. ──
     try:
-        from core.client import get_filters, adjust_qty, _write_lock
+        from core.client import get_filters, adjust_qty
         f = get_filters(pair)
         qty_str = adjust_qty(abs(amt), f["stepSize"], f["minQty"])
     except Exception as e:
@@ -791,7 +830,7 @@ def api_close_position(symbol: str) -> Any:
 
     order_id = None
     try:
-        # ── REV 1.5.7 — write lock. ──
+        # ── REV 1.5.8 — module-level _write_lock. ──
         with _write_lock:
             resp = client.futures_create_order(
                 symbol=pair,
@@ -813,13 +852,15 @@ def api_close_position(symbol: str) -> Any:
     settled = False
     try:
         time.sleep(1.5)
-        chk = client.futures_position_information(symbol=pair)
+        # ── REV 1.5.8 — read lock. ──
+        with _read_lock:
+            chk = client.futures_position_information(symbol=pair)
         still = float(chk[0].get("positionAmt", 0) or 0) if chk else 0.0
         if abs(still) <= 1e-9:
             settled = True
         else:
             add_log(f"⚠️ {sym_short} still {still} after first attempt — retrying")
-            # ── REV 1.5.7 — write lock. ──
+            # ── REV 1.5.8 — module-level _write_lock. ──
             with _write_lock:
                 client.futures_create_order(
                     symbol=pair,
@@ -829,7 +870,9 @@ def api_close_position(symbol: str) -> Any:
                     reduceOnly=True,
                 )
             time.sleep(1.5)
-            chk2 = client.futures_position_information(symbol=pair)
+            # ── REV 1.5.8 — read lock. ──
+            with _read_lock:
+                chk2 = client.futures_position_information(symbol=pair)
             still2 = float(chk2[0].get("positionAmt", 0) or 0) if chk2 else 0.0
             settled = abs(still2) <= 1e-9
     except Exception as e:
@@ -888,11 +931,13 @@ def _paginate_income(client: Any) -> list[dict]:
 
     for _ in range(CONFIG.max_income_pages):
         try:
-            batch = client.futures_income_history(
-                limit=CONFIG.income_page_size,
-                startTime=cursor_ms,
-                endTime=end_ms,
-            )
+            # ── REV 1.5.8 — read lock. ──
+            with _read_lock:
+                batch = client.futures_income_history(
+                    limit=CONFIG.income_page_size,
+                    startTime=cursor_ms,
+                    endTime=end_ms,
+                )
         except Exception as exc:
             add_log(f"⚠️ Income batch error: {_safe_err(exc)}")
             break
@@ -1122,7 +1167,9 @@ def _paginate_fills(client: Any, symbol: str) -> list[dict]:
         if from_id:
             params["fromId"] = from_id
         try:
-            batch = client.futures_account_trades(**params)
+            # ── REV 1.5.8 — read lock. ──
+            with _read_lock:
+                batch = client.futures_account_trades(**params)
         except Exception as exc:
             add_log(f"⚠️ Fills fetch error {symbol}: {_safe_err(exc)}")
             break

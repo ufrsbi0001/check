@@ -1,67 +1,27 @@
 """
 state.py — Runtime state for the trading engine.
 
-REV 1.3.20 (2026-10-05) — POWER-LOSS-SAFE STATE PERSISTENCE (H3):
-  ✅ MEDIUM (H3a): _atomic_json_write() now fsync()s the temp file
-     before the atomic rename, and best-effort fsyncs the containing
-     directory after. Previously the write relied on the OS to flush
-     buffers on replace — on a power loss or hard reboot, the renamed
-     file could be empty or stale. The atomic-rename pattern is only
-     half the guarantee; durability requires fsync. On Windows the
-     directory fsync is a no-op (AttributeError/OSError caught) — the
-     file fsync itself is what matters there.
+REV 1.3.21 (2026-10-05) — COIN-ROTATION RACE FIX:
+  ✅ Added _ROTATION_DATA_LOCK (RLock) around the read-modify-save
+     cycle in record_coin_trade(). Previously the cycle was:
+        data = load_coin_rotation()   # read from disk
+        data[today][symbol] += 1
+        save_coin_rotation(data)      # write to disk
+     Two threads calling this concurrently (e.g. entry.py processing
+     two different symbols in the same scan cycle) could interleave
+     so that one thread's increment was silently overwritten by the
+     other's — the daily per-coin trade cap could be bypassed.
+     _ROTATION_WRITE_LOCK inside save_coin_rotation() only serialised
+     the write, not the whole read-modify-write.
+  ✅ can_trade_coin() now reads rotation state under the same lock
+     so it never observes a torn view during a concurrent write.
+  ✅ Zero change to file format, load path, or call signatures.
 
-  ✅ MEDIUM (H3b): flush_active_trades() now deep-copies the trade
-     dict while HOLDING ACTIVE_TRADES_LOCK, then writes outside the
-     lock. Previously it did `data = dict(active_trades)` (a shallow
-     copy: inner trade dicts were still shared references) and then
-     ran json.dump OUTSIDE the lock. Any concurrent mutation of a
-     nested field (manage.py setting `partial_70_done`, entry.py
-     updating `sl_id`) could raise "dictionary changed size during
-     iteration" mid-dump — which was swallowed by the outer except,
-     so the flush silently did not happen. This revision snapshots
-     the full nested structure under the lock, so the dump always
-     sees a frozen, consistent view.
+REV 1.3.20 (2026-10-05) — POWER-LOSS-SAFE STATE PERSISTENCE (H3)
+  (retained — see file history below).
 
-  ✅ MEDIUM (H3c): get_active_trade() now returns a shallow dict()
-     copy instead of the live cache entry. Every current caller in
-     the codebase already re-adds after mutating, but this removes
-     the footgun for future maintainers: mutating the returned
-     object no longer silently corrupts the in-memory cache without
-     a corresponding flush. Behaviour for read-only callers is
-     identical.
-
-  ✅ Zero change to the happy path, the file format, or the load
-     path. Persisted JSON is byte-identical (json.dump with indent=2
-     — same separators). Only durability and snapshot semantics
-     change.
-
-REV 1.3.19 (2026-10-03) — CONCURRENCY + FAIL-CLOSED HARDENING:
-  ✅ CRITICAL: `DailyTracker` now guarded by `_DAILY_TRACKER_LOCK`
-     (RLock). Previously add_loss() / is_limit_reached() /
-     update_peak() / reset_if_new_day() were unsynchronised; a
-     read-modify-write on `loss_count` could lost-update under
-     concurrent calls from the scan loop and trade manager. The
-     DD kill-switch decision was therefore untrustworthy at exactly
-     the moment it mattered (crash / high activity).
-  ✅ CRITICAL: `is_limit_reached()` is now FAIL-CLOSED on unreadable
-     equity. Previously `if current_equity < 100: return False` meant
-     a failed equity fetch silently skipped the DD check. Now
-     equity <= 0 returns (True, "EQUITY_UNREADABLE") so the caller
-     halts instead of continuing to trade on a blind book.
-  ✅ Rollover logic consolidated: `_check_date_rollover()` now also
-     resets `start_balance` / `peak_balance` so the two functions
-     (`_check_date_rollover` and `reset_if_new_day`) can no longer
-     disagree about whether the day has turned.
-  ✅ `reset_if_new_day()` guards against an invalid `current_balance`
-     argument (0 / negative / NaN) — the caller's transient bad
-     read no longer corrupts the day's baseline.
-  ✅ Removed dead branch in `_load()` (peak_date != today was
-     unreachable under atomic write semantics).
-  ✅ `save_coin_rotation()` — snapshot under lock, disk I/O outside
-     (previously the write lock serialised a whole JSON dump while
-     other threads waited to read rotation state).
-
+REV 1.3.19 (2026-10-03) — CONCURRENCY + FAIL-CLOSED HARDENING
+  (retained).
 REV 1.3.18 (2026-10-03) — FAIL-FAST SAFETY-KEY VERIFICATION (retained).
 REV 1.3.17 (2026-10-02) — CONFIG CLEANUP (retained).
 REV 1.3.16 (2026-10-02) — DAILY TRACKER DATE-ROLLOVER FIX (retained).
@@ -238,9 +198,19 @@ def load_active_trades() -> None:
         if os.path.exists(ACTIVE_TRADES_FILE):
             with open(ACTIVE_TRADES_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            # Defensive: file could have been hand-edited or corrupted
+            # to a non-dict top-level (list, string). Skip cleanly.
+            if not isinstance(data, dict):
+                logger.warning(
+                    f"active_trades: expected dict, got "
+                    f"{type(data).__name__} — skipping load"
+                )
+                return
             with ACTIVE_TRADES_LOCK:
                 active_trades.clear()
                 for sym, trade in data.items():
+                    if not isinstance(trade, dict):
+                        continue
                     if 'sl_level' in trade:
                         lvl = trade['sl_level']
                         try:
@@ -308,6 +278,11 @@ def load_cooldowns() -> None:
         if os.path.exists(COOLDOWN_FILE):
             with open(COOLDOWN_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning(
+                    f"cooldowns: expected dict, got {type(data).__name__}"
+                )
+                return
             with COOLDOWN_LOCK:
                 for sym, ts_str in data.items():
                     try:
@@ -326,11 +301,12 @@ def load_cooldowns() -> None:
 def save_cooldowns() -> None:
     try:
         with _COOLDOWN_WRITE_LOCK:
+            now = datetime.now(PKT)
             with COOLDOWN_LOCK:
                 data = {
                     sym: ts.isoformat()
                     for sym, ts in cooldown_until.items()
-                    if ts > datetime.now(PKT)
+                    if ts > now
                 }
             _atomic_json_write(COOLDOWN_FILE, data)
     except Exception as e:
@@ -663,15 +639,27 @@ daily_tracker = DailyTracker()
 # COIN ROTATION
 #   REV 1.3.17 — MAX_TRADES_PER_COIN_PER_DAY now read LIVE
 #   REV 1.3.19 — snapshot under lock, disk I/O outside
+#   REV 1.3.21 — read-modify-save in record_coin_trade() now atomic
+#                under _ROTATION_DATA_LOCK (RLock). Fixes a
+#                lost-update race between concurrent entry threads.
 # ─────────────────────────────────────────────────────────────
 _ROTATION_WRITE_LOCK = threading.Lock()
+# REV 1.3.21 — guards the full read-modify-write on rotation JSON.
+# RLock so save_coin_rotation() can be called from inside a
+# record_coin_trade() critical section without self-deadlock.
+_ROTATION_DATA_LOCK = threading.RLock()
 
 
 def load_coin_rotation() -> dict:
     try:
         if os.path.exists(COIN_ROTATION_FILE):
             with open(COIN_ROTATION_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            logger.warning(
+                f"coin_rotation: expected dict, got {type(data).__name__}"
+            )
     except Exception as e:
         logger.warning(f"coin_rotation load error: {e}")
     return {}
@@ -703,7 +691,10 @@ def can_trade_coin(symbol: str) -> tuple[bool, str]:
         return False, f"{symbol} blacklisted"
     # REV 1.3.17 — LIVE read so UI/env runtime changes reflect immediately
     _max_per_day = int(CC.get("max_trades_per_coin_per_day", 2) or 2)
-    data = load_coin_rotation()
+    # REV 1.3.21 — read under lock so we never see a torn view while
+    # a concurrent record_coin_trade() is mid-write.
+    with _ROTATION_DATA_LOCK:
+        data = load_coin_rotation()
     today = str(datetime.now(PKT).date())
     count = data.get(today, {}).get(symbol, 0)
     if count >= _max_per_day:
@@ -714,12 +705,16 @@ def can_trade_coin(symbol: str) -> tuple[bool, str]:
 def record_coin_trade(symbol: str) -> None:
     # REV 1.3.17 — LIVE read
     _max_per_day = int(CC.get("max_trades_per_coin_per_day", 2) or 2)
-    data = load_coin_rotation()
-    today = str(datetime.now(PKT).date())
-    if today not in data:
-        data[today] = {}
-    data[today][symbol] = data[today].get(symbol, 0) + 1
-    save_coin_rotation(data)
+    # REV 1.3.21 — the ENTIRE read → modify → write cycle must be
+    # atomic. Previously concurrent calls could lost-update each
+    # other's increments, bypassing the daily per-coin cap.
+    with _ROTATION_DATA_LOCK:
+        data = load_coin_rotation()
+        today = str(datetime.now(PKT).date())
+        if today not in data:
+            data[today] = {}
+        data[today][symbol] = data[today].get(symbol, 0) + 1
+        save_coin_rotation(data)
     logger.info(
         f" [{symbol}] Daily trade: {data[today][symbol]}/{_max_per_day}"
     )

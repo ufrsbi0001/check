@@ -1,7 +1,30 @@
 """
 decision_engine.py — Multi-filter trade approval layer.
 
-REV 4.5 (2026-10-04) — RSI DIVERGENCE + FVG RETEST FILTERS:
+REV 4.6 (2026-10-05) — WEIGHTED VOTING + FAIL-CLOSED BTC BIAS:
+  ✅ DecisionScore.add() now accepts a `weight` parameter.
+       • Hard filters (trend_strength, mtf_consensus, volume_confirm,
+         recent_perf, correlation, volatility) → weight 1.0
+       • Soft confirmation filters (liquidity_sweep, rsi_divergence,
+         fvg_retest) → weight from config `soft_filter_weight`
+         (default 0.5, tunable).
+       • MTF filter with `use_mtf_confluence=False` (reason
+         "mtf_disabled") → weight 0.0 (no longer a free vote).
+  ✅ DecisionScore.approvals is now a float (was int) to support
+     fractional weighted votes.
+  ✅ _btc_bias_blocks() now FAIL-CLOSED when mode="high_risk_only"
+     and symbol is empty. Previously silently passed (allowed) — could
+     let un-vetted trades through a misconfigured caller.
+  ✅ New config key: DECISION.soft_filter_weight (default 0.5).
+  ✅ min_approvals default kept at 5. Operators should re-tune if
+     they were relying on the old (inflated) effective vote count.
+  ✅ Zero behaviour change for the six hard filters.
+  ✅ NOTE: this revision intentionally does NOT include the
+     "extreme" → "_extreme" change suggested in a recent review —
+     the code already used "_extreme" and the review was a false
+     positive.
+
+REV 4.5 (2026-10-04) — RSI DIVERGENCE + FVG RETEST FILTERS (retained):
   ✅ Added _filter_rsi_divergence() — reads ind_1h["divergence"]
      (already computed by market/indicators.py). Soft-pass vote:
      bullish div on BUY or bearish div on SELL → pass with boost.
@@ -85,6 +108,12 @@ _DEFAULT_DECISION = {
     # REV 4.5 — bumped 7 → 9 to match config_center REV 6.1
     # (added rsi_divergence + fvg_retest filters).
     "total_filters": 9,
+    # REV 4.6 — soft confirmation filters (liquidity_sweep,
+    # rsi_divergence, fvg_retest) contribute this fraction of a
+    # full vote. Set to 1.0 to restore pre-4.6 (inflated) behaviour.
+    # Set to 0.0 to make them info-only (they still appear in
+    # detail[] but never add to `approvals`).
+    "soft_filter_weight": 0.5,
     "btc_bias_enabled": True,
     "btc_bias_mode": "full",
     "btc_bias_high_risk_coins": frozenset(),
@@ -305,8 +334,10 @@ def _filter_mtf_consensus(side: str, ind_1h: dict, ind_4h: dict,
     Behaviour: 2 of 3 TFs must agree with the trade direction.
       • BUY  agrees if e20 > e50 AND price > e50
       • SELL agrees if e20 < e50 AND price < e50
-    When `use_mtf_confluence` is False, short-circuits to PASS with
-    reason "mtf_disabled" and still counts toward the total (free vote).
+
+    REV 4.6 — when `use_mtf_confluence` is False, the filter still
+    returns PASS with reason "mtf_disabled", but evaluate_trade()
+    assigns it weight 0.0 — so it is no longer a free vote.
 
     REV 4.2 — reads flag LIVE from config_center each call.
     """
@@ -374,6 +405,10 @@ def _filter_liquidity_sweep(side: str, ind_1h: dict):
       • Otherwise                      → pass with "no_sweep" reason.
     Never returns False — this filter ADDS a positive vote when the
     sweep aligns, but does not BLOCK trades on its absence.
+
+    REV 4.6 — evaluate_trade() applies `soft_filter_weight` (default
+    0.5) to this filter's contribution, so it is a partial vote, not
+    a full one.
     """
     try:
         if side == "BUY" and bool(ind_1h.get("sweep_bull")):
@@ -388,7 +423,7 @@ def _filter_liquidity_sweep(side: str, ind_1h: dict):
 
 
 # ═════════════════════════════════════════════════════════════
-#  REV 4.5 — RSI DIVERGENCE FILTER (NEW)
+#  REV 4.5 — RSI DIVERGENCE FILTER (retained)
 # ═════════════════════════════════════════════════════════════
 def _filter_rsi_divergence(side: str, ind_1h: dict):
     """
@@ -406,6 +441,7 @@ def _filter_rsi_divergence(side: str, ind_1h: dict):
       • No divergence      → pass with "no_divergence"
 
     Never returns False — preserves N-filter vote semantics.
+    REV 4.6 — soft-weighted (see `soft_filter_weight`).
     """
     try:
         div = str(ind_1h.get("divergence", "NONE")).upper()
@@ -423,7 +459,7 @@ def _filter_rsi_divergence(side: str, ind_1h: dict):
 
 
 # ═════════════════════════════════════════════════════════════
-#  REV 4.5 — FVG RETEST FILTER (NEW)
+#  REV 4.5 — FVG RETEST FILTER (retained)
 # ═════════════════════════════════════════════════════════════
 def _filter_fvg_retest(side: str, ind_1h: dict):
     """
@@ -441,6 +477,7 @@ def _filter_fvg_retest(side: str, ind_1h: dict):
       • SELL: price within [fvg_zone_bear_bottom, fvg_zone_bear_top]
 
     Soft-pass otherwise ("no_fvg_retest"). Never returns False.
+    REV 4.6 — soft-weighted (see `soft_filter_weight`).
     """
     try:
         price = float(ind_1h.get("price", 0) or 0)
@@ -524,6 +561,7 @@ def _filter_volatility(ind_1h: dict):
 #  BTC BIAS GATE (helper)
 #  REV 4.0 — 3 modes support (full | high_risk_only | disabled)
 #  REV 4.2 — all reads LIVE from config_center each call
+#  REV 4.6 — FAIL-CLOSED on empty symbol in high_risk_only mode
 # ═════════════════════════════════════════════════════════════
 def _btc_bias_blocks(side: str, symbol: str = "",
                      regime: Optional[str] = None) -> Optional[str]:
@@ -538,6 +576,12 @@ def _btc_bias_blocks(side: str, symbol: str = "",
 
     `regime` param (REV 4.3): optional pre-fetched BTC regime so the
     caller can avoid a second get_btc_regime() call for logging.
+
+    REV 4.6 — In `high_risk_only` mode, an empty/missing symbol is now
+    REJECTED (fail-closed) rather than silently allowed. Rationale: we
+    cannot verify high-risk membership without a symbol, and silently
+    allowing was a misconfiguration hazard for callers that forgot to
+    pass `symbol=`.
 
     Returns rejection reason string, or None if allowed.
     """
@@ -557,9 +601,12 @@ def _btc_bias_blocks(side: str, symbol: str = "",
     if _sym and not _sym.endswith("USDT"):
         _sym += "USDT"
 
-    # High-risk-only mode: allow all other coins freely
+    # High-risk-only mode: allow all NON-high-risk coins freely
     if _mode == "high_risk_only":
-        if not _sym or _sym not in _high_risk:
+        if not _sym:
+            # REV 4.6 — FAIL-CLOSED: cannot classify without symbol.
+            return "btc_bias_high_risk_mode_missing_symbol"
+        if _sym not in _high_risk:
             return None
 
     # Full mode or high-risk coin → check regime
@@ -577,17 +624,33 @@ def _btc_bias_blocks(side: str, symbol: str = "",
 @dataclass
 class DecisionScore:
     approved: bool = False
-    approvals: int = 0
+    # REV 4.6 — approvals is now a FLOAT to support weighted votes.
+    # Callers that used to read this as int should not be affected
+    # numerically (5.0 == 5 in comparisons), but be aware of the type.
+    approvals: float = 0.0
     # REV 4.3 — default 0; instance always sets from live config.
     total_filters: int = 0
     top_reason: str = ""
     reasons: list = field(default_factory=list)
     detail: dict = field(default_factory=dict)
 
-    def add(self, name: str, passed: bool, reason: str):
-        self.detail[name] = {"pass": passed, "reason": reason}
+    def add(self, name: str, passed: bool, reason: str,
+            weight: float = 1.0):
+        """
+        Register one filter result.
+
+        REV 4.6 — `weight` (default 1.0) is added to `approvals` when
+        the filter passes. Set weight < 1 for soft confirmation votes,
+        and weight = 0 for filters that should NOT count as a vote
+        (e.g. MTF when the feature is disabled).
+        """
+        self.detail[name] = {
+            "pass": passed,
+            "reason": reason,
+            "weight": weight,
+        }
         if passed:
-            self.approvals += 1
+            self.approvals += weight
         else:
             self.reasons.append(f"{name}:{reason}")
 
@@ -609,19 +672,28 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
 
       GATE 2: Same-side correlation limit.
 
-    If both gates pass, the N-filter vote runs.
-    Approve iff approvals >= min_approvals.
+    If both gates pass, the N-filter WEIGHTED vote runs.
+    Approve iff weighted approvals >= min_approvals.
+
+    Vote weighting (REV 4.6):
+      • 6 hard filters  → weight 1.0 each
+      • 3 soft filters  → weight `soft_filter_weight` (default 0.5)
+      • MTF filter with use_mtf_confluence=False → weight 0.0
+        (feature disabled; no free vote)
 
     REV 4.2 — All config values read LIVE from config_center, so
     update_runtime() takes effect on the very next call.
     REV 4.3 — BTC regime captured ONCE per call.
-    REV 4.4 — N is now 7 (added liquidity_sweep confirmation filter).
-    REV 4.5 — N is now 9 (added rsi_divergence + fvg_retest filters).
+    REV 4.4 — N is 7 (added liquidity_sweep confirmation filter).
+    REV 4.5 — N is 9 (added rsi_divergence + fvg_retest filters).
+    REV 4.6 — Vote is weighted; soft filters contribute 0.5.
     """
     # Live reads (fresh per call)
-    _min_approvals = int(_dec_get("min_approvals", 5))
+    _min_approvals = float(_dec_get("min_approvals", 5))
     # REV 4.5 — default bumped 7 → 9 to match config_center REV 6.1.
     _total_filters = int(_dec_get("total_filters", 9))
+    # REV 4.6 — soft confirmation vote weight.
+    _soft_w = float(_dec_get("soft_filter_weight", 0.5))
     _max_ss = int(_global_get("max_same_side_positions", 2))
     _btc_mode = _dec_get("btc_bias_mode", "full")
 
@@ -638,7 +710,7 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     btc_reason = _btc_bias_blocks(side, symbol, regime=_btc_regime_snapshot)
     if btc_reason:
         result.approved = False
-        result.approvals = 0
+        result.approvals = 0.0
         result.top_reason = f"HARD_REJECT: {btc_reason}"
         result.reasons = [f"btc_bias:{btc_reason}"]
         result.detail["btc_bias"] = {"pass": False, "reason": btc_reason}
@@ -655,7 +727,7 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     same_side_count = _count_same_side(side, active)
     if same_side_count >= _max_ss:
         result.approved = False
-        result.approvals = 0
+        result.approvals = 0.0
         result.top_reason = (
             f"HARD_REJECT: {same_side_count} same-side already open "
             f"(max {_max_ss})"
@@ -675,14 +747,21 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
         return result
 
     # ═══════════════════════════════════════════════════════════
-    #  NORMAL N-FILTER VOTE  (now 9 filters — REV 4.5)
+    #  WEIGHTED N-FILTER VOTE  (9 filters — REV 4.6)
     # ═══════════════════════════════════════════════════════════
     _is_trend_following = strategy not in COUNTER_TREND_STRATEGIES
 
+    # ── Hard filters (weight 1.0) ──────────────────────────────
     result.add("trend_strength",
                *_filter_trend_strength(side, strategy, ind_1h))
-    result.add("mtf_consensus",
-               *_filter_mtf_consensus(side, ind_1h, ind_4h, ind_1d))
+
+    # MTF gets weight 0.0 when the feature is off (no free vote).
+    _mtf_pass, _mtf_reason = _filter_mtf_consensus(
+        side, ind_1h, ind_4h, ind_1d
+    )
+    _mtf_weight = 0.0 if _mtf_reason == "mtf_disabled" else 1.0
+    result.add("mtf_consensus", _mtf_pass, _mtf_reason, weight=_mtf_weight)
+
     result.add("volume_confirm",
                *_filter_volume_confirmation(side, ind_1h,
                                             strict=_is_trend_following))
@@ -692,15 +771,17 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
                *_filter_correlation(side, active))
     result.add("volatility",
                *_filter_volatility(ind_1h))
+
+    # ── Soft confirmation filters (weight = _soft_w) ───────────
     # REV 4.4 — 7th filter: liquidity sweep
     result.add("liquidity_sweep",
-               *_filter_liquidity_sweep(side, ind_1h))
-    # REV 4.5 — 8th filter: RSI divergence (NEW)
+               *_filter_liquidity_sweep(side, ind_1h), weight=_soft_w)
+    # REV 4.5 — 8th filter: RSI divergence
     result.add("rsi_divergence",
-               *_filter_rsi_divergence(side, ind_1h))
-    # REV 4.5 — 9th filter: FVG retest (NEW)
+               *_filter_rsi_divergence(side, ind_1h), weight=_soft_w)
+    # REV 4.5 — 9th filter: FVG retest
     result.add("fvg_retest",
-               *_filter_fvg_retest(side, ind_1h))
+               *_filter_fvg_retest(side, ind_1h), weight=_soft_w)
 
     result.approved = result.approvals >= _min_approvals
     result.top_reason = (
@@ -709,9 +790,11 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     )
 
     tag = "✅" if result.approved else "🚫"
+    # REV 4.6 — `:g` formatting shows 5 instead of 5.0, and 5.5 as 5.5.
     logger.info(
         f"[decision] {tag} {symbol} {side} [{strategy}] "
-        f"{result.approvals}/{result.total_filters} "
+        f"{result.approvals:g}/{result.total_filters} "
+        f"(min {_min_approvals:g}) "
         f"conf={conf:.0f}% rr={rr:.2f} → {result.top_reason}"
     )
     if not result.approved:
@@ -743,7 +826,9 @@ def get_stats() -> dict:
         "paused_strategies": pauses,
         "btc_regime": get_btc_regime(),
         "btc_bias_mode": _dec_get("btc_bias_mode", "full"),
-        "min_approvals": int(_dec_get("min_approvals", 5)),
+        "min_approvals": float(_dec_get("min_approvals", 5)),
         # REV 4.5 — fallback bumped 7 → 9 for consistency.
         "total_filters": int(_dec_get("total_filters", 9)),
+        # REV 4.6 — expose soft-filter weight for UI/diagnostics.
+        "soft_filter_weight": float(_dec_get("soft_filter_weight", 0.5)),
     }
