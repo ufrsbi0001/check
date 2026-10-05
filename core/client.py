@@ -4,6 +4,42 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
+REV 11.7 (2026-10-05) — TIMEOUT HONESTY + DECIMAL FALLBACK PRECISION:
+  ✅ CRITICAL (A): _run_with_timeout() no longer abandons lock-holding
+     workers on the best-effort path. Previously, a 6s caller cap on
+     futures_account / exchange_info / any non-order call could fire
+     BEFORE the HTTP session timeout (10s), leaving the worker thread
+     alive and HOLDING _read_lock. With the Phase-2 read/write split,
+     _read_lock is contended by analytics, orphan-watch, get_trade_status,
+     _pick_real_sl, and every klines fetch — so one abandoned worker
+     queued every other reader behind it, silently converting a single
+     slow call into a reader-wide stall.
+
+     Fix: the effective timeout for best-effort callers is now
+     max(caller, HTTP session timeout) — the SAME floor critical
+     callers already had. The 6s cap is gone. The caller now waits
+     honestly for the worker to finish (or for the socket layer to
+     kill the request at 10s), after which the lock is provably
+     released.
+
+     Trade-off: individual best-effort calls may block their caller
+     for up to 10s instead of 6s in the worst case. That is the
+     correct trade — the previous behaviour only gave the ILLUSION
+     of a shorter wait; the lock was still held for the full 10s.
+
+  ✅ MEDIUM (B): adjust_qty() / adjust_price() fallback paths now
+     re-format the value via Decimal using step/tick's exponent,
+     matching the primary path's output contract. Previously the
+     fallback returned `str(min_qty)` / `str(price)` verbatim, which
+     could violate Binance's strict -1111 precision rules if the
+     input's decimal representation differed from the step's
+     (e.g. min_qty=Decimal('0.0010') → "0.0010" while the exchange
+     expects "0.001"). The new fallback is a best-effort repair, not
+     a full floor-to-step, but it is precision-correct.
+
+  ✅ Removed the now-unused `_TIMEOUT_EXECUTOR_CAP` constant. Its
+     only purpose was the cap that A eliminates.
+
 REV 11.6 (2026-10-05) — DEPRECATED ALIAS REMOVED (Phase 2 cleanup):
   ✅ The deprecated `_requests_lock = _write_lock` alias has been
      REMOVED. Every consumer file has been migrated to the explicit
@@ -190,26 +226,25 @@ _TS_LOCK = threading.Lock()
 _TS_OFFSET = {'value': 0, 'time': 0.0}
 _TS_TTL = 60.0
 
-# REV 11.3 (A1) — two pools, split by consequence of failure.
+# REV 11.3 (A1) / REV 11.7 (A) — two pools, split by consequence of failure.
 #
 #   _TIMEOUT_EXECUTOR           — best-effort pool.
-#     Used for: futures_account, exchangeInfo, and any other
-#     non-order call. Caller timeout capped at 6s so workers free
-#     earlier than the 10s HTTP session timeout. A timeout here is
-#     a latency nuisance, not an ambiguity risk.
+#     Used for: futures_account, exchangeInfo, get_open_orders probes,
+#     and any other non-order call. 32 workers.
 #
 #   _CRITICAL_TIMEOUT_EXECUTOR  — order-placement pool.
 #     Used for: futures_create_order (market entries, STOP_MARKET
 #     SL, TAKE_PROFIT_MARKET TP1/TP2, SL updates, emergency closes).
-#     NO upper cap, MINIMUM 10s effective timeout (matches the HTTP
-#     session timeout). A timeout here WOULD create an ambiguity
-#     window — if we give up at 6s while the order is still in
-#     flight, the retry path could double-submit. Waiting the full
-#     session timeout eliminates that class of false-ambiguous.
+#     8 workers.
 #
-#   pool sizes: best-effort 32 (parallel scan + analytics + dashboard),
-#   critical 8 (max simultaneous in-flight orders; a bot with
-#   max_open_positions=3 + emergency closes will not exceed this).
+#   REV 11.7: BOTH pools now floor the effective wait at the HTTP
+#   session timeout (10s). Previously best-effort was capped at 6s,
+#   which caused the CALLER to give up while the WORKER was still in
+#   flight — still holding _read_lock for up to the full session
+#   timeout. The cap only gave the illusion of a shorter wait.
+#   Now: the caller waits the full session timeout and the worker is
+#   guaranteed to have returned (or been killed by the socket layer)
+#   before control returns. Bounded lock-hold time, honest wait.
 _TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=32, thread_name_prefix="apicl"
 )
@@ -217,14 +252,10 @@ _CRITICAL_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="apicrit"
 )
 
-# Best-effort caller cap (unchanged from REV 11.2).
-_TIMEOUT_EXECUTOR_CAP = 6.0
-
-# REV 11.3 (A1) — critical-path floor. This matches the HTTP session
-# timeout configured in set_client_keys(). A caller requesting less
-# than this (e.g. 5s) is lifted up to it. A caller requesting more
-# is honored as-is. This is the value that guarantees we never
-# abandon an in-flight order placement before the socket layer does.
+# REV 11.7 — floor for ALL callers (both pools). Matches the HTTP
+# session timeout configured in set_client_keys(). A caller that
+# requests less is lifted to it; a caller that requests more is
+# honored as-is.
 _CRITICAL_MIN_TIMEOUT = 10.0
 
 # REV 11.3 (A1) — desc prefixes that route to the critical pool.
@@ -270,25 +301,33 @@ def _is_critical_desc(desc: str) -> bool:
 
 def _run_with_timeout(fn, timeout, desc="api_call"):
     """
-    REV 11.3 (A1) — split pools by consequence of failure.
+    REV 11.3 (A1) / REV 11.7 (A) — split pools by consequence of
+    failure. Both pools share the same effective-timeout floor.
 
-    Best-effort callers (analytics, klines, exchangeInfo):
-      • effective_timeout = min(timeout, _TIMEOUT_EXECUTOR_CAP)   # 6s
-      • runs on _TIMEOUT_EXECUTOR (32 workers)
-      • timeout → zombie counter, warn at 8
+    Effective timeout for BOTH pools:
+        effective = max(timeout, _CRITICAL_MIN_TIMEOUT)   # ≥10s
+    The floor equals the HTTP session timeout (set_client_keys),
+    so we NEVER give up on a worker before the socket layer does.
+    This applies to best-effort callers too — see REV 11.7 (A) note
+    in the module docstring for why the old 6s cap was removed.
 
-    Critical callers (order placement, SL/TP updates):
-      • effective_timeout = max(timeout, _CRITICAL_MIN_TIMEOUT)   # ≥10s
-      • runs on _CRITICAL_TIMEOUT_EXECUTOR (8 workers)
-      • timeout → critical zombie counter, warn at 3
-      • NO upper cap — caller controls if it needs >10s
+    Pool routing is unchanged:
+      • desc starts with a _CRITICAL_DESC_PREFIXES entry → critical
+        pool (8 workers). This is the order-placement path.
+      • otherwise → best-effort pool (32 workers).
 
-    A timeout on a CRITICAL call means the order may still be in flight
-    at the exchange. The retry path MUST resolve via
+    Caller must name order-placement calls with one of the critical
+    desc prefixes ("market:", "sl:", "tp1:", "tp2:", "update_sl:",
+    "emg:"), otherwise they land in the best-effort pool. The pool
+    only affects worker-pool sizing and zombie-warning threshold;
+    the timeout floor is now identical for both.
+
+    A timeout on a critical call means the order may still be in
+    flight at the exchange. The retry path MUST resolve via
     _resolve_ambiguous_market (entry.py) or the deterministic-cid
-    retry (exit.py). Because we now wait the full 10s HTTP timeout,
-    this class of false-ambiguous is effectively eliminated for
-    healthy exchange responses.
+    retry (exit.py). Since we wait the full session timeout, this
+    class of false-ambiguous is effectively eliminated for healthy
+    exchange responses.
 
     Exceptions propagate to the caller (TimeoutError or the wrapped
     function's exception).
@@ -296,22 +335,20 @@ def _run_with_timeout(fn, timeout, desc="api_call"):
     is_critical = _is_critical_desc(desc)
 
     if is_critical:
-        # Floor at the HTTP session timeout so we never give up on an
-        # in-flight order before the socket layer does.
-        effective_timeout = max(timeout, _CRITICAL_MIN_TIMEOUT)
         executor = _CRITICAL_TIMEOUT_EXECUTOR
         zombie_counter = _critical_zombie_count
         zombie_lock = _critical_zombie_lock
         warn_threshold = _CRITICAL_ZOMBIE_WARN_THRESHOLD
         pool_label = "critical"
     else:
-        # Best-effort: cap so workers free earlier than the HTTP timeout.
-        effective_timeout = min(timeout, _TIMEOUT_EXECUTOR_CAP)
         executor = _TIMEOUT_EXECUTOR
         zombie_counter = _zombie_count
         zombie_lock = _zombie_lock
         warn_threshold = _ZOMBIE_WARN_THRESHOLD
         pool_label = "best-effort"
+
+    # REV 11.7 — both pools share the same floor. See module docstring.
+    effective_timeout = max(timeout, _CRITICAL_MIN_TIMEOUT)
 
     fut = executor.submit(fn)
 
@@ -323,7 +360,10 @@ def _run_with_timeout(fn, timeout, desc="api_call"):
     try:
         return fut.result(timeout=effective_timeout)
     except concurrent.futures.TimeoutError:
-        # Worker is still running — decrement when it lands.
+        # Worker is still running despite the floor being == session
+        # timeout. This is unexpected — means the socket layer did not
+        # honor its own timeout (e.g. TCP half-open). Decrement when
+        # it eventually lands.
         try:
             fut.add_done_callback(_on_done)
         except Exception:
@@ -335,8 +375,7 @@ def _run_with_timeout(fn, timeout, desc="api_call"):
             logger.warning(
                 f"[executor:{pool_label}] {n} in-flight task(s) after "
                 f"timeout on '{desc}' (effective_timeout={effective_timeout:.1f}s). "
-                f"API latency high — consider raising timeouts or "
-                f"throttling callers."
+                f"HTTP session timeout did not fire — network layer issue?"
             )
         raise
 
@@ -492,9 +531,11 @@ _ACCOUNT_CACHE_TTL = 60.0
 
 def get_account_cached() -> dict:
     """
-    REV 11.2 — TTL 60s, caller timeout 6s (capped by executor).
-    REV 11.3 (A1) — still non-critical; runs on best-effort pool.
+    REV 11.2 — TTL 60s.
+    REV 11.3 (A1) — non-critical; runs on best-effort pool.
     REV 11.5 — account fetch is a read → _read_lock.
+    REV 11.7 — best-effort floor is now the full session timeout
+    (10s), not 6s. See module docstring REV 11.7 (A).
     """
     with _ACCOUNT_CACHE_LOCK:
         if _ACCOUNT_CACHE['data'] is not None and \
@@ -577,7 +618,8 @@ def _get_exchange_info() -> dict:
                 # REV 11.5 — read.
                 with _read_lock:
                     return _global_client.futures_exchange_info()
-            # REV 11.3 (A1) — non-critical desc → best-effort pool, 6s cap.
+            # REV 11.3 (A1) — non-critical desc → best-effort pool.
+            # REV 11.7 — effective timeout now 10s (session timeout floor).
             info = _run_with_timeout(_fetch, 6, "exchange_info")
             with _EXCHANGE_INFO_LOCK:
                 _EXCHANGE_INFO_CACHE['data'] = info
@@ -849,6 +891,17 @@ def get_filters(pair: str) -> dict:
 # DECIMAL ADJUSTMENT
 # ─────────────────────────────────────────────────────────────
 def adjust_qty(qty, step, min_qty) -> str:
+    """
+    Floor `qty` to `step`, clamp to `min_qty`, and format with the
+    step's decimal precision.
+
+    REV 11.7 (B) — the fallback path (on any exception in the primary
+    path) now re-formats via Decimal using step's exponent, matching
+    the primary path's output contract. Previously it returned
+    str(min_qty) verbatim, which could violate Binance's strict
+    precision rules (e.g. min_qty=Decimal('0.0010') → "0.0010" while
+    the exchange expects "0.001") and trigger -1111.
+    """
     try:
         step_dec = Decimal(str(step))
         qty_d = (Decimal(str(qty)) // step_dec) * step_dec
@@ -859,11 +912,35 @@ def adjust_qty(qty, step, min_qty) -> str:
             return format(qty_d, f'.{abs(exp)}f')
         return format(qty_d, 'f')
     except Exception as e:
+        # ── REV 11.7 (B) — fallback preserves step precision ──
         logger.warning(f"adjust_qty error {e}")
-        return str(min_qty)
+        try:
+            step_dec = Decimal(str(step))
+            exp = step_dec.as_tuple().exponent
+            mq = Decimal(str(min_qty))
+            if exp < 0:
+                return format(mq, f'.{abs(exp)}f')
+            return format(mq, 'f')
+        except Exception:
+            # Both primary and fallback failed — return the raw value.
+            # At this point the caller is in a state where nothing is
+            # safe; the exchange will reject with -1111 and the retry
+            # path (handle_order_filter_error → invalidate_filters)
+            # will fetch fresh filters.
+            return str(min_qty)
 
 
 def adjust_price(price, tick) -> str:
+    """
+    Floor `price` to `tick` and format with the tick's decimal
+    precision.
+
+    REV 11.7 (B) — the fallback path (on any exception in the primary
+    path) now re-formats via Decimal using tick's exponent, matching
+    the primary path's output contract. Previously it returned
+    str(price) verbatim, which could violate Binance's strict
+    precision rules and trigger -1111.
+    """
     try:
         tick_dec = Decimal(str(tick))
         price_d = (Decimal(str(price)) // tick_dec) * tick_dec
@@ -872,8 +949,17 @@ def adjust_price(price, tick) -> str:
             return format(price_d, f'.{abs(exp)}f')
         return format(price_d, 'f')
     except Exception as e:
+        # ── REV 11.7 (B) — fallback preserves tick precision ──
         logger.warning(f"adjust_price error {e}")
-        return str(price)
+        try:
+            tick_dec = Decimal(str(tick))
+            exp = tick_dec.as_tuple().exponent
+            p = Decimal(str(price))
+            if exp < 0:
+                return format(p, f'.{abs(exp)}f')
+            return format(p, 'f')
+        except Exception:
+            return str(price)
 
 
 # ─────────────────────────────────────────────────────────────

@@ -1,6 +1,40 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.43 (2026-10-05) — SCAN BATCH WALL-TIME CAP:
+  ✅ The parallel indicator fetch in main_loop() no longer blocks the
+     scan cycle indefinitely when one or more workers hang. Previously
+     `for fut in as_completed(futures):` had NO timeout — a single
+     hung Binance call (network partition, rate-limit storm, TCP
+     half-open) would freeze the entire scan cycle, delaying:
+       • the DD kill-switch check
+       • new-entry evaluation for all subsequent cycles
+     (The trade manager thread runs independently and was NOT
+     affected; only the scan loop itself was vulnerable.)
+
+     Fix — three parts:
+       1. as_completed(futures, timeout=_PARALLEL_FETCH_BATCH_TIMEOUT)
+          with a 15s batch cap.
+       2. On TimeoutError, log a WARNING with done/pending counts and
+          proceed with whatever results arrived — partial universe
+          beats no universe.
+       3. The pool is now created EXPLICITLY (not via `with`) so we
+          can call pool.shutdown(wait=False) in a finally. The
+          `with ThreadPoolExecutor(...)` idiom would call
+          shutdown(wait=True) on block exit — which would WAIT for
+          the abandoned workers and defeat the whole point of the
+          timeout. wait=False lets the caller proceed immediately;
+          in-flight workers finish in the background (client.py
+          REV 11.7 guarantees they release _read_lock within the
+          HTTP session timeout, ~10s).
+
+     Effect: the scan cycle now has a hard upper bound on its wall
+     time even under catastrophic API behaviour. The DD check, entry
+     evaluation, and scan_completed log line all fire on schedule.
+
+     Zero change to the happy path (all workers finish well under
+     15s). Only the pathological case gets a different code path.
+
 REV 1.4.42 (2026-10-05) — WRITE-LOCK MIGRATION (Phase 2, Step 5):
   ✅ _place_adoption_stop() now acquires _c._write_lock instead of
      the legacy _c._requests_lock alias (= _write_lock). This is the
@@ -34,28 +68,11 @@ REV 1.4.41 (2026-10-05) — SAFETY + OBSERVABILITY PATCH:
      config_center.GLOBAL. Fails LOUD instead of leaving a subtle
      CONFIG.<attr> → AttributeError landmine for the first reader.
 
-REV 1.4.40 (2026-10-04) — IN-POSITION VISIBILITY IN SCANNER:
-  ✅ FIXED: The `action` column previously showed "IN POSITION" only
-     for coins whose signal had fired and passed all filters — because
-     the IN POSITION check lived inside the `if trade_side:` block. A
-     coin that was already held but whose CURRENT signal happened to
-     be NEUTRAL showed the raw signal-rejection reason instead
-     (e.g. "SKIP (RANGE_SCALPER:no_pattern)"), making it look like the
-     bot was ignoring the open trade.
-  ✅ Now: `_has_open_position` is computed from active_trades_list at
-     the top of the coin loop. If True, the action column shows
-     "IN POSITION" regardless of what the signal did.
-  ✅ Display-only change. Zero effect on trading logic — the position
-     management path (manage_single_trade) is unchanged.
-  ✅ Effect: scanner rows for TRX, CRV, UNI, AVAX, XPL now show
-     "IN POSITION" (previously they showed SKIP reasons because their
-     1h signal was NEUTRAL). OP already showed "IN POSITION" because
-     its signal fired; now all 6 open coins are consistent.
-
-REV 1.4.39 (2026-10-04) — ARM ORPHAN-WATCH ON DIRECT-CLI PATH.
-REV 1.4.38 (2026-10-04) — PATTERN COLUMN NOW SHOWS ACTUAL STRATEGY.
-REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP.
-REV 1.4.36 (2026-10-04) — LOG BANNER SYNC TO 9-FILTER ENGINE.
+REV 1.4.40 (2026-10-04) — IN-POSITION VISIBILITY IN SCANNER (retained).
+REV 1.4.39 (2026-10-04) — ARM ORPHAN-WATCH ON DIRECT-CLI PATH (retained).
+REV 1.4.38 (2026-10-04) — PATTERN COLUMN NOW SHOWS ACTUAL STRATEGY (retained).
+REV 1.4.37 (2026-10-04) — DEAD _cfg CLEANUP (retained).
+REV 1.4.36 (2026-10-04) — LOG BANNER SYNC TO 9-FILTER ENGINE (retained).
 REV 1.4.35 (2026-10-04) — DEV-MODE ENTRY GUARD (Point 1) (retained).
 REV 1.4.34 (2026-10-04) — OBSERVABILITY UPGRADE (Point 5) (retained).
 REV 1.4.33 (2026-10-04) — ADOPTED SL FROM CONFIG (Point 4) (retained).
@@ -71,7 +88,11 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    TimeoutError as _FutTimeout,
+)
 from pathlib import Path
 from datetime import datetime
 
@@ -208,6 +229,19 @@ CSV_EXIT_FILE     = _s.CSV_EXIT_FILE
 PAUSE_FILE        = _s.PAUSE_FILE
 
 _PARALLEL_FETCH_WORKERS = 8
+
+# ── REV 1.4.43 — scan batch wall-time cap. ──
+# Upper bound on how long the main-loop's parallel indicator fetch
+# will wait for as_completed() before proceeding with whatever
+# results arrived. Prevents one hung Binance call from freezing the
+# scan cycle (and therefore the DD kill-switch check and the next
+# cycle's entry evaluation) indefinitely.
+#
+# Chosen larger than the client-side HTTP session timeout (10s) so
+# normal slow-but-not-broken API days don't trip it. Any single
+# call that hits the session timeout (10s) still completes inside
+# the 15s window. Only true hangs trigger the batch timeout.
+_PARALLEL_FETCH_BATCH_TIMEOUT = 15.0
 
 # Adopted orphan fallback SL: wide safety net when entry price is
 # unavailable or the repair path needs a value to act on.
@@ -1283,25 +1317,61 @@ def main_loop():
 
                 indicators_by_coin: dict = {}
                 if candidates:
+                    # ═══════════════════════════════════════════════
+                    #  REV 1.4.43 — SCAN BATCH WALL-TIME CAP.
+                    #
+                    #  Explicit pool (NOT `with`), because the `with`
+                    #  context manager calls shutdown(wait=True) on
+                    #  exit — which would WAIT for abandoned workers
+                    #  and defeat the as_completed timeout below.
+                    #
+                    #  On timeout we log and proceed with whatever
+                    #  results arrived. The abandoned workers finish
+                    #  in the background; client.py REV 11.7
+                    #  guarantees they release _read_lock within the
+                    #  HTTP session timeout (~10s).
+                    # ═══════════════════════════════════════════════
+                    pool = None
                     try:
-                        with ThreadPoolExecutor(
+                        pool = ThreadPoolExecutor(
                             max_workers=_PARALLEL_FETCH_WORKERS,
                             thread_name_prefix="ind_fetch",
-                        ) as pool:
-                            futures = {
-                                pool.submit(_fetch_coin_indicators, c): c
-                                for c in candidates
-                            }
-                            for fut in as_completed(futures):
+                        )
+                        futures = {
+                            pool.submit(_fetch_coin_indicators, c): c
+                            for c in candidates
+                        }
+                        try:
+                            for fut in as_completed(
+                                futures,
+                                timeout=_PARALLEL_FETCH_BATCH_TIMEOUT,
+                            ):
                                 _coin_for_fut = futures[fut]
                                 try:
                                     _c_key, _res, _dfs = fut.result()
-                                    indicators_by_coin[_c_key] = (_res, _dfs)
+                                    indicators_by_coin[_c_key] = (
+                                        _res, _dfs
+                                    )
                                 except Exception as _fe:
                                     logger.debug(
                                         f"Parallel fetch failed for "
                                         f"{_coin_for_fut}: {_fe}"
                                     )
+                        except _FutTimeout:
+                            _done = sum(
+                                1 for f in futures if f.done()
+                            )
+                            _pending = len(futures) - _done
+                            logger.warning(
+                                f"[scan] parallel indicator fetch "
+                                f"timed out after "
+                                f"{_PARALLEL_FETCH_BATCH_TIMEOUT:.0f}s — "
+                                f"{_done}/{len(futures)} workers "
+                                f"completed, {_pending} still pending. "
+                                f"Proceeding with partial universe; "
+                                f"pending workers will finish in "
+                                f"background."
+                            )
                     except Exception as _pe:
                         logger.warning(
                             f"Parallel fetch pool error: {_pe} — "
@@ -1315,6 +1385,18 @@ def main_loop():
                                 indicators_by_coin[_c_key] = (_res, _dfs)
                             except Exception:
                                 continue
+                    finally:
+                        if pool is not None:
+                            # REV 1.4.43 — wait=False: do not block the
+                            # caller on abandoned workers. Their read
+                            # locks are released within the HTTP session
+                            # timeout by design (client.py REV 11.7).
+                            try:
+                                pool.shutdown(wait=False)
+                            except Exception as _sde:
+                                logger.debug(
+                                    f"[scan] pool shutdown: {_sde}"
+                                )
 
                 for coin in candidates:
                     results, dfs_closed = indicators_by_coin.get(coin, ({}, {}))
