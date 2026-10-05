@@ -1,25 +1,19 @@
 """
 orders/utils.py — Shared constants and low-level helpers.
 
-REV 23.1 (2026-10-03) — DEAD CONSTANT CLEANUP + SL SELECTION CLARITY:
-  ✅ Removed dead module-level config snapshots:
-       LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS,
-       MAX_TOTAL_MARGIN_PCT, PARTIAL_CLOSE_USDT, MAX_HOLD_MINUTES.
-     All were imported ONCE at module load — runtime update_runtime()
-     changes did not propagate. Every consumer (orders/entry.py
-     REV 1.8.0, orders/manage.py REV 1.9.0) already migrated to live
-     CC.get() reads. Verified dead via grep before removal.
-  ✅ Also removed now-unused `from core import config_center as CC`
-     module alias (only served the removed snapshots).
-  ✅ DRY_RUN retained — still consumed by orders/entry.py.
-  ✅ _pick_real_sl: algo-order fallback loop now skips empty-type
-     records (matches the primary regular-order loop's strictness).
-     Previously an empty type would slip through and could pick a
-     TP trigger price as an SL candidate.
-  ✅ _derive_sl_level: "no risk_unit" warning downgraded to debug —
-     the % fallback path is a designed graceful degradation, not an
-     error condition, and it fires frequently on legacy trades.
+REV 23.3 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE:
+  ✅ `get_trade_status()` computes PnL from `breakEvenPrice` (which
+     includes entry commission), NOT `entryPrice`. This is what
+     Binance Futures UI does.
+  ✅ `pnl_pct` and `roi_pct` both derive from the break-even basis.
+  ✅ Falls back to `entryPrice` if `breakEvenPrice` is missing
+     (older demo API schemas) — zero behaviour change in that case.
+  ✅ Sign-safe for both LONG and SHORT.
+  ✅ Adds `break_even` field to the response for UI/debug visibility.
 
+REV 23.2.1 (2026-10-05) — LEVERAGE FALLBACK TO CONFIG.
+REV 23.2 (2026-10-05) — LEVERAGED ROI IN TRADE STATUS.
+REV 23.1 (2026-10-03) — DEAD CONSTANT CLEANUP + SL SELECTION CLARITY.
 REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py.
 """
@@ -47,8 +41,6 @@ from core.config_center import (
 # ═════════════════════════════════════════════════════════════
 #  Constants
 # ═════════════════════════════════════════════════════════════
-# REV 23.1 — Only DRY_RUN remains here. All trading-parameter
-# snapshots were removed; consumers read LIVE via CC.get().
 DRY_RUN = CONFIG.dry_run
 
 
@@ -99,7 +91,6 @@ def _get_risk_unit(active: dict | None) -> float | None:
 
 # ═════════════════════════════════════════════════════════════
 #  Per-vol-class thresholds
-#  REV 23.0 — Now served by config_center.VOL_CLASS_R_THRESHOLDS.
 # ═════════════════════════════════════════════════════════════
 def _vol_class(symbol: str) -> str:
     try:
@@ -110,10 +101,6 @@ def _vol_class(symbol: str) -> str:
 
 
 def _r_thresholds_per_class(symbol: str, cfg: dict) -> dict:
-    """
-    REV 23.0 — Reads from config_center.VOL_CLASS_R_THRESHOLDS.
-    Falls back to MED if vol_class not found.
-    """
     vcls = _vol_class(symbol)
     base = _VOL_CLASS_R_THRESHOLDS.get(vcls, _VOL_CLASS_R_THRESHOLDS["MED"])
     return {
@@ -132,17 +119,7 @@ def _r_thresholds_per_class(symbol: str, cfg: dict) -> dict:
 #  SL discovery — most advanced SL on the book
 # ═════════════════════════════════════════════════════════════
 def _pick_real_sl(pair, entry, is_long):
-    """
-    Return the most-advanced SL on the book.
-
-    "Most advanced" = highest SL for a LONG, lowest SL for a SHORT
-    (i.e. closest to or past entry — reflects the current SL level).
-
-    REV 23.1 — algo-order fallback now skips empty-type records,
-    matching the primary regular-order loop. Otherwise an algo order
-    with no type field could contribute its trigger price (possibly
-    a TP) as an SL candidate.
-    """
+    """Return the most-advanced SL on the book."""
     candidates = []
     client = _cl()
     if client is None:
@@ -170,7 +147,6 @@ def _pick_real_sl(pair, entry, is_long):
         try:
             for o in _get_open_algo_orders(pair):
                 otype = (o.get('type') or o.get('orderType') or '').upper()
-                # REV 23.1 — strict type match (empty type excluded).
                 if otype not in ('STOP_MARKET', 'STOP'):
                     continue
                 try:
@@ -209,7 +185,6 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
             if actual_sl >= lk1_stop - tol:  return 2
             if actual_sl >= be_stop  - tol:  return 1
             return 0
-        # REV 23.1 — debug not warning: % fallback is by-design graceful.
         logger.debug(f"_derive_sl_level: no risk_unit for entry={entry}")
         if actual_sl >= entry * 1.005:   return 3
         elif actual_sl >= entry * 1.002: return 2
@@ -236,7 +211,13 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
 #  get_trade_status — read-only UI helper
 # ═════════════════════════════════════════════════════════════
 def get_trade_status(symbol, pos: dict = None):
-    """Rich trade status for the UI — SL, level, PnL, side, qty."""
+    """
+    Rich trade status for the UI — SL, level, PnL, side, qty.
+
+    REV 23.2 — adds `roi_pct` (leverage × price move) and `leverage`.
+    REV 23.2.1 — leverage falls back to config_center.leverage.
+    REV 23.3 — PnL now computed from breakEvenPrice (Binance UI parity).
+    """
     pair = symbol + 'USDT'
     client = _cl()
     if client is None:
@@ -257,9 +238,45 @@ def get_trade_status(symbol, pos: dict = None):
             logger.debug(f"get_trade_status {symbol}: entry=0, skipping")
             return None
         mark = float(pos['markPrice'])
-        pnl = float(pos['unRealizedProfit'])
-        pnl_pct = ((mark - entry) / entry * 100) if amt > 0 else ((entry - mark) / entry * 100)
         is_long = amt > 0
+
+        # ── REV 23.3 — Binance UI parity via break-even price ──
+        try:
+            be_price = float(pos.get('breakEvenPrice', 0) or 0)
+        except (TypeError, ValueError):
+            be_price = 0.0
+        if be_price <= 0:
+            be_price = entry
+
+        if is_long:
+            pnl = (mark - be_price) * abs(amt)
+            pnl_pct = (mark - be_price) / entry * 100
+        else:
+            pnl = (be_price - mark) * abs(amt)
+            pnl_pct = (be_price - mark) / entry * 100
+
+        # ── REV 23.2 / 23.2.1 — leveraged ROI on margin ──
+        leverage = None
+        try:
+            _lev_raw = pos.get('leverage', None)
+            if _lev_raw not in (None, ''):
+                _lv = int(float(_lev_raw))
+                if _lv >= 1:
+                    leverage = _lv
+        except (TypeError, ValueError):
+            leverage = None
+
+        if leverage is None:
+            try:
+                from core import config_center as _CC
+                leverage = int(_CC.get('leverage', 1) or 1)
+                if leverage < 1:
+                    leverage = 1
+            except Exception:
+                leverage = 1
+
+        roi_pct = pnl_pct * leverage
+
         active = get_active_trade(symbol)
         risk_unit = _get_risk_unit(active) if active else None
         sl_price, _ = _pick_real_sl(pair, entry, is_long)
@@ -317,6 +334,9 @@ def get_trade_status(symbol, pos: dict = None):
         return {
             'symbol': symbol, 'entry': entry, 'mark': mark,
             'pnl': pnl, 'pnl_pct': pnl_pct,
+            'roi_pct': roi_pct,
+            'leverage': leverage,
+            'break_even': be_price,
             'sl': sl_price, 'sl_level': sl_level,
             'side': 'LONG' if is_long else 'SHORT',
             'qty': abs(amt)

@@ -353,13 +353,37 @@ async function fetchStatus(){
        const pnl = Number(t.pnl||0);
        const pnl_pct = Number(t.pnl_pct||0);
        const isManual = !!t.is_manual;
+
+       /* ── REV 1.6.0 — Leveraged ROI display ──
+          Binance Futures UI shows ROI on margin (price % × leverage).
+          This is what users see on the exchange app. Bot previously
+          showed only the raw price-move %, which confused users
+          comparing the two (e.g. LTC +0.28% in bot vs +1.27% on
+          Binance — same position, different metric).
+
+          `roi_pct` comes from orders/utils.py::get_trade_status REV 23.2
+          or web/app.py::_normalize_position REV 1.5.4. If missing
+          (older payload / edge case), fall back to raw price %.
+       */
+       const roi_pct = (t.roi_pct !== undefined && t.roi_pct !== null)
+                       ? Number(t.roi_pct) : null;
+       const leverage = Number(t.leverage || 1);
+
+       const pctValue = (roi_pct !== null) ? roi_pct : pnl_pct;
+       const pctSign  = pctValue >= 0 ? '+' : '';
+       const pctText  = `${pctSign}${pctValue.toFixed(2)}%`;
+
+       const pctTitle = (roi_pct !== null)
+         ? `Price move ${pnl_pct>=0?'+':''}${pnl_pct.toFixed(2)}% × ${leverage}× leverage = ${roi_pct>=0?'+':''}${roi_pct.toFixed(2)}% ROI on margin`
+         : `Price move ${pnl_pct>=0?'+':''}${pnl_pct.toFixed(2)}%`;
+
        return `<tr data-sym="${esc((t.symbol||'').toUpperCase())}">
   <td><div class="cell-inner left"><span class="val sym-val">${esc(t.symbol)}</span></div></td>
   <td><div class="cell-inner center"><span class="badge ${side==='LONG'?'badge-buy':'badge-sell'}">${esc(side)}</span></div></td>
   <td><div class="cell-inner right"><span class="val">$${entry}</span></div></td>
   <td><div class="cell-inner right"><span class="val">$${mark}</span></div></td>
   <td><div class="cell-inner right"><span class="val">${qty}</span></div></td>
-  <td><div class="cell-inner right"><span class="pnl-chip ${pnl>=0?'pnl-chip-pos':'pnl-chip-neg'}">${pnl>=0?'▲':'▼'} ${pnl>=0?'+':''}$${pnl.toFixed(2)} <span style="opacity:.7;font-size:10px">(${pnl>=0?'+':''}${pnl_pct.toFixed(2)}%)</span></span></div></td>
+  <td><div class="cell-inner right"><span class="pnl-chip ${pnl>=0?'pnl-chip-pos':'pnl-chip-neg'}" title="${esc(pctTitle)}">${pnl>=0?'▲':'▼'} ${pnl>=0?'+':''}$${pnl.toFixed(2)} <span style="opacity:.7;font-size:10px">(${esc(pctText)} ROI)</span></span></div></td>
   <td><div class="cell-inner center"><span class="sl-badge">${esc(slDisplay)}</span></div></td>
   <td><div class="cell-inner center"><span class="badge ${isManual?'badge-manual':'badge-bot'}">${isManual?'MANUAL':'BOT'}</span></div></td>
 </tr>`;

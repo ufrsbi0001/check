@@ -1,40 +1,26 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
-REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX:
-  ✅ CRITICAL: bot_runner() finally-block now calls request_stop()
-     BEFORE joining the trade_manager thread. Previously the
-     tm_thread was joined with a 15s timeout but never signalled to
-     stop — so it ALWAYS timed out, stayed alive, and blocked the
-     next Start click with "Trade manager still shutting down" (429).
-     Worse: without the stop signal, the tm_thread could survive into
-     the next bot_runner() launch, running TWO trade managers on the
-     same account. The fix signals stop first, THEN joins.
-  ✅ REMOVED dead module-level `stop_flag` (was set in api_start /
-     api_stop but never read anywhere). Zero behaviour change for
-     callers since the true stop signal is `core.state.request_stop()`
-     → `_stop_event.set()`, which is unchanged.
+REV 1.5.6 (2026-10-05) — BINANCE UI PARITY VIA BREAK-EVEN PRICE:
+  ✅ `_normalize_position()` fallback now computes PnL from
+     `breakEvenPrice` (which includes entry commission), matching
+     what Binance Futures UI shows. Mirrors orders/utils.py REV 23.3.
+     Previously bot showed +$3.11 / +0.70% ROI vs Binance's
+     +$2.52 / +0.56% on the same 5× LTC tick.
+  ✅ Falls back to `entryPrice` when breakEvenPrice is missing.
+  ✅ Adds `break_even` field to the payload for UI/debug visibility.
 
-REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS:
-  ✅ REMOVED @rate_limit(1) from /api/status and /api/scan. The
-     dashboard polls these read-only endpoints at >1 req/sec, and
-     the 1/sec limiter was returning 429 to legitimate UI traffic
-     ("Too many requests" toast; Start Engine click appeared to
-     fail). Read-only endpoints that only return aggregate state
-     are safe to leave unthrottled for local use — external DoS
-     protection is the reverse proxy's job when the dashboard is
-     exposed beyond localhost. Mutating endpoints (start/stop/
-     close_position/time_exit POST/analytics refresh) RETAIN their
-     rate limits.
+REV 1.5.5 (2026-10-05) — LEVERAGE FALLBACK TO CONFIG:
+  ✅ `_normalize_position()` fallback now mirrors REV 23.2.1 in
+     orders/utils.py: if the exchange payload omits `leverage`
+     (Binance DEMO schema difference), fall back to
+     `config_center.leverage` instead of silently degrading to 1×.
 
-REV 1.5.1 (2026-10-03) — ERROR VISIBILITY + CACHING (retained):
-  • Fixed empty "Balance fetch error:" (TimeoutError has empty str).
-  • get_bot_status prefers get_balance_or_last_good() over
-    get_account_cached() — last-good fallback on timeout.
-  • _fetch_positions_cached() — 3s TTL + _requests_lock.
-  • _safe_err() helper — never logs a bare colon.
-
-REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING (retained).
+REV 1.5.4 (2026-10-05) — ROI % IN POSITION PAYLOAD.
+REV 1.5.3 (2026-10-04) — TRADE-MANAGER LIFECYCLE FIX.
+REV 1.5.2 (2026-10-03) — RATE-LIMIT RELAXATION FOR READS.
+REV 1.5.1 (2026-10-03) — ERROR VISIBILITY + CACHING.
+REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING.
 REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING.
 REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API.
 REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION.
@@ -67,10 +53,7 @@ from core.config import CONFIG, print_config_banner
 PKT = timezone(timedelta(hours=5))
 LOG_PREFIX_IDLE = "⏳ System idle. Waiting for API keys."
 
-# ── REV 1.5.0 — TIME_EXIT hold_minutes bound (24 h) ──
 _MAX_HOLD_MINUTES = 1440
-
-# ── REV 1.5.1 — position cache TTL (seconds) ──
 _POS_CACHE_TTL = 3.0
 
 
@@ -161,11 +144,6 @@ def _refresh_timestamp() -> None:
 
 
 def _safe_err(exc: BaseException) -> str:
-    """
-    REV 1.5.1 — some exceptions (e.g. concurrent.futures.TimeoutError)
-    have an empty str(). Fall back to the class name so logs never
-    show a bare "error: " with nothing after the colon.
-    """
     return str(exc) or type(exc).__name__
 
 
@@ -238,11 +216,6 @@ bot_thread: Optional[threading.Thread] = None
 tm_thread: Optional[threading.Thread] = None
 start_time: Optional[float] = None
 
-# REV 1.5.3 — module-level `stop_flag` REMOVED.
-# The authoritative stop signal is core.state.request_stop() →
-# _stop_event.set(), which bot_runner now calls explicitly. The old
-# flag was written in api_start / api_stop but never read anywhere.
-
 
 def add_log(msg: str) -> None:
     entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -252,12 +225,6 @@ def add_log(msg: str) -> None:
 
 
 def _read_daily_loss_count(fallback: int = 0) -> int:
-    """
-    REV 1.4.2 — Read the current day's loss count from DailyTracker.
-    REV 1.5.0 — accepts a fallback (previous value) so a transient
-                tracker failure doesn't overwrite a correct non-zero
-                count with 0 on the dashboard.
-    """
     try:
         from core.state import daily_tracker
         return int(daily_tracker.get_loss_count())
@@ -267,10 +234,7 @@ def _read_daily_loss_count(fallback: int = 0) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
-# REV 1.5.1 — POSITION CACHE
-# Prevents the dashboard's 5s polling from issuing ~12 calls/min
-# for futures_position_information, and serialises shared-session
-# use against the trading engine via _requests_lock.
+# POSITION CACHE
 # ─────────────────────────────────────────────────────────────
 _pos_cache: dict[str, Any] = {"data": None, "time": 0.0}
 _pos_cache_lock = threading.Lock()
@@ -283,8 +247,6 @@ def _fetch_positions_cached(client: Any) -> list:
                 now - _pos_cache["time"] < _POS_CACHE_TTL:
             return _pos_cache["data"]
 
-    # Serialise with the trading engine's own calls on the shared
-    # requests.Session. _requests_lock is an RLock, reentrant-safe.
     try:
         from core.client import _requests_lock as _rl
     except Exception:
@@ -356,22 +318,6 @@ def api_error(message: str, status: int = 500) -> tuple[Response, int]:
 # BOT RUNNER
 # ─────────────────────────────────────────────────────────────
 def bot_runner() -> None:
-    """
-    Run the trading engine main loop in a background thread.
-
-    REV 1.5.3 — CRITICAL LIFECYCLE FIX:
-      The finally-block now calls request_stop() BEFORE joining the
-      trade-manager thread. Previously the join(15) always timed out
-      because nothing told the tm_thread to exit — which left it
-      alive across bot restarts, blocking the next Start click with
-      "Trade manager still shutting down" (429) and, in bad
-      scenarios, running TWO managers on the same account.
-
-      Order matters:
-        1. bot_state["running"] = False  (UI reflects stop immediately)
-        2. request_stop()                (signal main_loop AND tm_loop)
-        3. join tm_thread with timeout   (now it can actually exit)
-    """
     global start_time, tm_thread
     start_time = time.time()
 
@@ -405,10 +351,6 @@ def bot_runner() -> None:
             bot_state["running"] = False
         add_log("⏹️ Bot stopped.")
 
-        # ── REV 1.5.3 — CRITICAL: signal ALL engine threads to stop ──
-        # Without this, trade_manager_loop keeps spinning (it only
-        # exits on is_stopped() == True), and the join() below times
-        # out — leaving the tm_thread alive into the next run.
         try:
             _stop_fn = _engine_attr("request_stop", "core.state")
             if callable(_stop_fn):
@@ -456,7 +398,13 @@ def _resolve_sl_price(client: Any, symbol_pair: str) -> float:
 
 
 def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
-    """Convert raw Binance position dict into the UI's trade shape."""
+    """
+    Convert raw Binance position dict into the UI's trade shape.
+
+    REV 1.5.4 — adds `roi_pct` and `leverage` in the FALLBACK path.
+    REV 1.5.5 — leverage falls back to config_center.leverage.
+    REV 1.5.6 — PnL computed from breakEvenPrice (Binance UI parity).
+    """
     try:
         amt = float(pos.get("positionAmt", 0))
         if abs(amt) <= 1e-6:
@@ -481,10 +429,46 @@ def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
         if not st:
             entry = float(pos.get("entryPrice", 0))
             mark = float(pos.get("markPrice", 0))
-            pnl = float(pos.get("unRealizedProfit", 0))
-            pnl_pct = ((mark - entry) / entry * 100) if entry else 0.0
-            if amt < 0:
-                pnl_pct = -pnl_pct
+
+            # ── REV 1.5.6 — Binance UI parity via break-even price ──
+            # Mirrors orders/utils.py REV 23.3. breakEvenPrice includes
+            # entry commission; using entryPrice inflated our PnL by
+            # ~$0.60 on a 5× LTC position vs Binance's display.
+            try:
+                be_price = float(pos.get("breakEvenPrice", 0) or 0)
+            except (TypeError, ValueError):
+                be_price = 0.0
+            if be_price <= 0:
+                be_price = entry
+
+            if amt > 0:
+                pnl = (mark - be_price) * abs(amt)
+                pnl_pct = ((mark - be_price) / entry * 100) if entry else 0.0
+            else:
+                pnl = (be_price - mark) * abs(amt)
+                pnl_pct = ((be_price - mark) / entry * 100) if entry else 0.0
+
+            # ── REV 1.5.5 — leveraged ROI on margin (Binance UI parity) ──
+            leverage = None
+            try:
+                _lev_raw = pos.get("leverage", None)
+                if _lev_raw not in (None, ""):
+                    _lv = int(float(_lev_raw))
+                    if _lv >= 1:
+                        leverage = _lv
+            except (TypeError, ValueError):
+                leverage = None
+
+            if leverage is None:
+                try:
+                    from core import config_center as _CC
+                    leverage = int(_CC.get("leverage", 1) or 1)
+                    if leverage < 1:
+                        leverage = 1
+                except Exception:
+                    leverage = 1
+
+            roi_pct = pnl_pct * leverage
 
             st = {
                 "symbol": symbol_short,
@@ -493,6 +477,9 @@ def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
                 "mark": mark,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
+                "roi_pct": roi_pct,
+                "leverage": leverage,
+                "break_even": be_price,   # REV 1.5.6 — exposed for UI/debug
                 "qty": abs(amt),
                 "sl": _resolve_sl_price(client, symbol_pair),
                 "is_manual": True,
@@ -506,15 +493,6 @@ def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
 def get_bot_status() -> dict[str, Any]:
     """
     No network call inside state_lock — prevents UI freeze / DoS.
-
-    REV 1.5.0 — reads daily_tracker.get_loss_count() and mirrors into
-                bot_state["daily_loss"]. Uses previous value as
-                fallback on read failure (no zero-overwrite).
-    REV 1.5.1 — prefers get_balance_or_last_good() (last-good fallback
-                on timeout) over get_account_cached() (raises on
-                timeout → log spam every 5s during demo latency).
-                Positions fetched via _fetch_positions_cached()
-                (3s TTL + _requests_lock).
     """
     with state_lock:
         is_running = bot_state["running"]
@@ -546,7 +524,6 @@ def get_bot_status() -> dict[str, Any]:
     trades: list[dict[str, Any]] = []
     client = get_client()
     if client is not None:
-        # ── REV 1.5.1 — prefer last-good-aware balance fetcher ──
         try:
             bal_fn = _engine_attr("get_balance_or_last_good", "core.client")
             if callable(bal_fn):
@@ -554,7 +531,6 @@ def get_bot_status() -> dict[str, Any]:
                 if degraded:
                     add_log("⚠️ Balance from last-good (fresh fetch failed)")
             else:
-                # Fallback to the older path if the helper isn't available
                 cached_fn = _engine_attr("get_account_cached", "core.client")
                 if callable(cached_fn):
                     acc = cached_fn()
@@ -566,7 +542,6 @@ def get_bot_status() -> dict[str, Any]:
         except Exception as exc:
             add_log(f"⚠️ Balance fetch error: {_safe_err(exc)}")
 
-        # ── REV 1.5.1 — cached positions + shared lock ──
         try:
             for pos in _fetch_positions_cached(client):
                 st = _normalize_position(client, pos)
@@ -597,13 +572,6 @@ def dashboard() -> str:
 
 @app.route("/api/status")
 def api_status() -> Response:
-    """
-    REV 1.5.2 — removed @rate_limit(1). The dashboard polls this
-    endpoint at >1 req/sec; the 1/sec limiter was returning 429 to
-    legitimate UI traffic ("Too many requests" toast). Read-only
-    endpoints returning aggregate state are safe to leave
-    unthrottled for local use.
-    """
     return jsonify(get_bot_status())
 
 
@@ -615,10 +583,6 @@ def api_config() -> Response:
 
 @app.route("/api/scan")
 def api_scan() -> Response:
-    """
-    REV 1.5.2 — removed @rate_limit(1). Same reasoning as /api/status:
-    read-only, polled by the dashboard at high frequency.
-    """
     if not TT_AVAILABLE:
         return jsonify({"results": [], "timestamp": "--"})
 
@@ -702,9 +666,6 @@ def api_start() -> Any:
             bot_state["keys_set"] = True
 
         add_log("✅ API keys validated. Initializing engine...")
-        # REV 1.5.3 — dead stop_flag removed. The engine thread is
-        # started here; the actual stop signal is request_stop() from
-        # bot_runner's finally-block / api_stop.
         bot_thread = threading.Thread(
             target=bot_runner, daemon=True, name="bot_runner"
         )
@@ -746,7 +707,6 @@ def api_stop() -> Any:
             except Exception as exc:
                 log.warning("request_stop() raised: %s", _safe_err(exc))
 
-    # REV 1.5.3 — dead stop_flag removed.
     add_log("⏹️ Stopping bot...")
 
     try:
@@ -886,7 +846,6 @@ def api_close_position(symbol: str) -> Any:
     except Exception:
         pass
 
-    # REV 1.5.1 — bust position cache so UI reflects the close immediately
     with _pos_cache_lock:
         _pos_cache["data"] = None
         _pos_cache["time"] = 0.0
@@ -1392,7 +1351,7 @@ def api_decision_stats() -> Response:
 
 
 # ─────────────────────────────────────────────────────────────
-# TIME EXIT TOGGLE (REV 1.4.1)
+# TIME EXIT TOGGLE
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/time_exit", methods=["GET"])
 def api_time_exit_get() -> Response:
@@ -1418,8 +1377,8 @@ def api_time_exit_set() -> Any:
 
     Body:
         {
-          "enabled": true|false,       # required
-          "hold_minutes": 180          # optional, 0–1440 (24 h)
+          "enabled": true|false,
+          "hold_minutes": 180
         }
     """
     try:
