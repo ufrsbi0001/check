@@ -4,7 +4,50 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
-REV 11.7 (2026-10-05) — TIMEOUT HONESTY + DECIMAL FALLBACK PRECISION:
+REV 11.8 (2026-10-05) — ALGO-ORDER FETCH FAIL-CLOSED (H5b):
+  ✅ MEDIUM (H5b): _get_open_algo_orders() now returns None on error
+     instead of []. Previously any failure (network hiccup, rate-limit
+     storm, missing SDK method) returned an empty list — which callers
+     read as "no protective stops exist". Consequences:
+
+       • robust_cancel_all() in exit.py could log
+         "All orphaned orders cancelled" when it had not actually been
+         able to read the algo-order book.
+       • orphan-cancel paths in repair.py could report 0 cancelled
+         when they had silently skipped every check.
+       • manage.py's TP1-detection could conclude "no TP1 open"
+         (i.e. TP1 filled) on the basis of a failed fetch, and
+         promote SL to BE prematurely.
+
+     Return contract is now:
+
+         list of dicts — success (may be empty; means "no orders")
+         None          — the fetch itself failed; state is UNKNOWN
+
+     Callers MUST branch on None and treat it as "cannot determine"
+     rather than "empty". Existing callers that do
+     `for o in _get_open_algo_orders(pair):` inside a try/except will
+     silently get a TypeError (caught), so the bot does not crash —
+     but to fully realise the fix, callers should be migrated to:
+
+         _algo = _get_open_algo_orders(pair)
+         if _algo is None:
+             # unknown — do NOT assume empty
+             ...
+         else:
+             for o in _algo:
+                 ...
+
+     A legacy shim is deliberately NOT provided: a shim would let
+     un-migrated callers keep the fail-open behaviour silently, which
+     is the exact class of bug this change eliminates. Prefer to
+     migrate the callers (see the "caller impact" notes in the
+     REV 11.8 summary).
+
+     Zero change to the happy path: when the fetch succeeds, the
+     return value is a list (possibly empty) exactly as before.
+
+REV 11.7 (2026-10-05) — TIMEOUT HONESTY + DECIMAL FALLBACK PRECISION (retained):
   ✅ CRITICAL (A): _run_with_timeout() no longer abandons lock-holding
      workers on the best-effort path. Previously, a 6s caller cap on
      futures_account / exchange_info / any non-order call could fire
@@ -1239,14 +1282,61 @@ def assert_sdk_methods() -> None:
     logger.info("✅ SDK algo-order methods present")
 
 
-def _get_open_algo_orders(pair: str) -> list:
+def _get_open_algo_orders(pair: str) -> Optional[list]:
+    """
+    Fetch the list of open algo orders for `pair`.
+
+    Return contract (REV 11.8 — H5b):
+
+      • list of dicts — the exchange returned a (possibly empty) list.
+                        An empty list means "no algo orders exist" —
+                        a valid, trustworthy state.
+
+      • None          — the fetch itself failed. The true state is
+                        UNKNOWN. Callers MUST NOT treat None as
+                        "no orders exist".
+
+    REV 11.8 rationale:
+      Previously this function returned [] on any exception. That made
+      a failed fetch indistinguishable from an empty book, and callers
+      read it as "no protective stops exist". Concrete consequences:
+
+        • exit.py::robust_cancel_all could log "All orphaned orders
+          cancelled" when it could not read the algo-order book —
+          the check `if not remaining and not remaining_algo` was
+          True both for "empty" and for "unreadable".
+        • repair.py orphan-cancel paths could report 0 cancelled when
+          they had silently skipped every check.
+        • manage.py TP1-detection could conclude "no TP1 open" (i.e.
+          TP1 filled) from a failed fetch and promote SL to BE
+          prematurely.
+
+      The new contract separates "empty" from "unknown". Callers must
+      branch:
+
+          _algo = _get_open_algo_orders(pair)
+          if _algo is None:
+              # unknown — do NOT assume empty. Leave state alone,
+              # retry next cycle, or escalate.
+              logger.warning(f"[{pair}] algo-order list unreadable")
+              return  # or continue / fail-closed as appropriate
+          for o in _algo:
+              ...
+
+      Existing callers that do `for o in _get_open_algo_orders(pair):`
+      inside a try/except will get a TypeError from iterating None,
+      which is caught — so the bot does not crash. Behaviour for those
+      callers is effectively unchanged (silent skip) until they are
+      migrated to the None-aware contract above.
+    """
     getter = getattr(_global_client, 'futures_get_open_algo_orders', None)
     if getter is None:
         logger.error(
             "[algo] futures_get_open_algo_orders missing on client — "
             "call assert_sdk_methods() at startup"
         )
-        return []
+        # REV 11.8 — SDK method missing is UNKNOWN, not empty.
+        return None
     try:
         # REV 11.5 — listing algo orders is a read.
         with _read_lock:
@@ -1256,7 +1346,8 @@ def _get_open_algo_orders(pair: str) -> list:
         return resp or []
     except Exception as e:
         logger.debug(f"algo orders {pair}: {e}")
-        return []
+        # REV 11.8 — fetch failed is UNKNOWN, not empty.
+        return None
 
 
 def _cancel_algo_order(pair: str, algo_id) -> bool:

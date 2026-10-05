@@ -1,6 +1,41 @@
 """
 state.py — Runtime state for the trading engine.
 
+REV 1.3.20 (2026-10-05) — POWER-LOSS-SAFE STATE PERSISTENCE (H3):
+  ✅ MEDIUM (H3a): _atomic_json_write() now fsync()s the temp file
+     before the atomic rename, and best-effort fsyncs the containing
+     directory after. Previously the write relied on the OS to flush
+     buffers on replace — on a power loss or hard reboot, the renamed
+     file could be empty or stale. The atomic-rename pattern is only
+     half the guarantee; durability requires fsync. On Windows the
+     directory fsync is a no-op (AttributeError/OSError caught) — the
+     file fsync itself is what matters there.
+
+  ✅ MEDIUM (H3b): flush_active_trades() now deep-copies the trade
+     dict while HOLDING ACTIVE_TRADES_LOCK, then writes outside the
+     lock. Previously it did `data = dict(active_trades)` (a shallow
+     copy: inner trade dicts were still shared references) and then
+     ran json.dump OUTSIDE the lock. Any concurrent mutation of a
+     nested field (manage.py setting `partial_70_done`, entry.py
+     updating `sl_id`) could raise "dictionary changed size during
+     iteration" mid-dump — which was swallowed by the outer except,
+     so the flush silently did not happen. This revision snapshots
+     the full nested structure under the lock, so the dump always
+     sees a frozen, consistent view.
+
+  ✅ MEDIUM (H3c): get_active_trade() now returns a shallow dict()
+     copy instead of the live cache entry. Every current caller in
+     the codebase already re-adds after mutating, but this removes
+     the footgun for future maintainers: mutating the returned
+     object no longer silently corrupts the in-memory cache without
+     a corresponding flush. Behaviour for read-only callers is
+     identical.
+
+  ✅ Zero change to the happy path, the file format, or the load
+     path. Persisted JSON is byte-identical (json.dump with indent=2
+     — same separators). Only durability and snapshot semantics
+     change.
+
 REV 1.3.19 (2026-10-03) — CONCURRENCY + FAIL-CLOSED HARDENING:
   ✅ CRITICAL: `DailyTracker` now guarded by `_DAILY_TRACKER_LOCK`
      (RLock). Previously add_loss() / is_limit_reached() /
@@ -36,6 +71,7 @@ REV 1.3.5  (2026-09-23) — ATOMIC WRITES + PEAK FIX.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -105,13 +141,46 @@ BLACKLISTED_COINS           = set(CONFIG.blacklisted_coins)
 
 # ─────────────────────────────────────────────────────────────
 # ATOMIC JSON WRITE
+#   REV 1.3.20 — fsync file + best-effort dir fsync for durability
 # ─────────────────────────────────────────────────────────────
 def _atomic_json_write(path: str, data: Any) -> bool:
+    """
+    Atomic + durable JSON write.
+
+    Order of operations:
+      1. Write to a unique temp file in the same directory.
+      2. flush()  — push Python buffers to the OS.
+      3. fsync()  — push OS buffers to disk.
+      4. os.replace() — atomic rename over the destination.
+      5. fsync(dir) — best-effort: flush the directory entry so the
+         rename itself survives a crash. No-op / AttributeError on
+         Windows (POSIX-only concept); swallowed.
+
+    The atomic-rename alone (pre-REV 1.3.20) protected against torn
+    writes but not against power loss: the destination could end up
+    as a zero-byte file if the rename landed but the data had not.
+    fsync closes that window for the file content. The directory
+    fsync closes it for the rename metadata on POSIX.
+    """
     tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        # Best-effort directory fsync. Windows does not support
+        # opening a directory as a file descriptor, so this is
+        # wrapped and silently skipped there.
+        try:
+            _dir = os.path.dirname(os.path.abspath(path))
+            _dfd = os.open(_dir, os.O_RDONLY)
+            try:
+                os.fsync(_dfd)
+            finally:
+                os.close(_dfd)
+        except (OSError, AttributeError):
+            pass
         return True
     except Exception as e:
         logger.error(f"Atomic write failed for {path}: {e}")
@@ -140,6 +209,7 @@ def is_stopped() -> bool:
 
 # ─────────────────────────────────────────────────────────────
 # ACTIVE TRADES
+#   REV 1.3.20 — flush deep-copies under lock; get returns copy
 # ─────────────────────────────────────────────────────────────
 active_trades: dict[str, dict] = {}
 ACTIVE_TRADES_LOCK = threading.Lock()
@@ -147,9 +217,19 @@ _ACTIVE_WRITE_LOCK = threading.Lock()
 
 
 def flush_active_trades() -> None:
+    """
+    Persist active_trades to disk.
+
+    REV 1.3.20 — deep-copy under ACTIVE_TRADES_LOCK, then write
+    outside the lock. The deep-copy ensures the JSON dump sees a
+    frozen snapshot: a concurrent mutation of a NESTED field (e.g.
+    manage.py setting `partial_70_done`) can no longer raise
+    "dictionary changed size during iteration" mid-dump — which the
+    outer except would have swallowed, silently skipping the flush.
+    """
     with _ACTIVE_WRITE_LOCK:
         with ACTIVE_TRADES_LOCK:
-            data = dict(active_trades)
+            data = copy.deepcopy(active_trades)
         _atomic_json_write(ACTIVE_TRADES_FILE, data)
 
 
@@ -192,8 +272,20 @@ def remove_active_trade(symbol: str) -> None:
 
 
 def get_active_trade(symbol: str) -> dict:
+    """
+    Return a shallow copy of the cached trade dict.
+
+    REV 1.3.20 — a copy is returned so a caller mutating the result
+    cannot silently corrupt the in-memory cache without a matching
+    flush_active_trades(). Nested dicts are still shared references;
+    callers that need to mutate deeply should deep-copy themselves
+    (or better, mutate a fresh dict and call add_active_trade).
+    Every current caller already re-adds after mutation, so this
+    change is behaviour-neutral for them.
+    """
     with ACTIVE_TRADES_LOCK:
-        return active_trades.get(symbol, {})
+        t = active_trades.get(symbol)
+        return dict(t) if t else {}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -359,6 +451,7 @@ def get_v2_stats_str() -> str:
 #   REV 1.3.18 — import-time verification of safety keys
 #   REV 1.3.19 — thread-safe (RLock); fail-CLOSED on bad equity;
 #                rollover consolidated
+#   REV 1.3.20 — persistence uses fsync'd writes (via _atomic_json_write)
 # ─────────────────────────────────────────────────────────────
 _DAILY_TRACKER_LOCK = threading.RLock()
 

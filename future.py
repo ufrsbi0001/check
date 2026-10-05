@@ -1,6 +1,68 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.45 (2026-10-05) — DURABLE DD-HALT PAUSE MARKER:
+  ✅ MEDIUM (C2 partial): the DD kill-switch's PAUSE_FILE write now
+     fsyncs both the file and (best-effort, POSIX-only) the containing
+     directory. Without fsync, the halt marker could sit in the OS
+     page cache and be lost on a power loss / hard reboot, letting
+     the bot restart into a non-halted state after having already
+     flattened on a DD breach.
+
+     Two fsyncs:
+       1. File fsync — pushes the DD_HALT marker content to disk
+          before the file descriptor closes. Without it, a crash
+          between close() and the OS's eventual page-cache flush
+          could leave an empty or partial PAUSE_FILE.
+       2. Directory fsync — best-effort, POSIX-only. Persists the
+          directory entry (filename → inode mapping) so the file is
+          discoverable after reboot. No-op on Windows (opening a
+          directory as a file descriptor is not supported there;
+          wrapped in except (OSError, AttributeError)).
+
+     Zero change to the happy path (write succeeds → same file
+     contents, same restart behaviour). Only the durability guarantee
+     improves. Startup-side `if Path(PAUSE_FILE).exists()` check is
+     unchanged.
+
+     Persist-FIRST restructuring (write PAUSE_FILE *before*
+     flattening positions) is DEFERRED — the current persist-AFTER
+     design is safe because daily_tracker's DD state is persisted
+     independently to LOSS_FILE, so a mid-flatten crash still
+     re-trips the kill-switch on the next startup. Only a crash in
+     the narrow window just before PKT midnight would fail to
+     re-trigger (date rollover resets the daily peak), and that
+     corner case is queued for the C2 follow-up after live
+     observations.
+
+REV 1.4.44 (2026-10-05) — SPREAD FILTER FAIL-CLOSED (H5a):
+  ✅ HIGH (H5a): the spread filter no longer fails OPEN when the
+     bookTicker for a coin is missing. Previously:
+
+         _bt = book_tickers.get(coin)
+         if _bt:
+             # ...spread check...
+             trade_side = None   # on breach
+
+     If `_bt` was None (fetch failed for this coin, coin absent from
+     the batch response, or the cycle's book_tickers fetch returned
+     an empty dict entirely), the whole spread check was SKIPPED and
+     the entry proceeded. A halted, thinly-listed, or newly-listed
+     symbol could therefore enter with no spread validation.
+
+     Now: an `else` branch rejects the entry with skip_reason
+     "NO TICKER (spread filter)" and a WARNING log. The trade manager
+     still manages any EXISTING position on that coin (this only
+     blocks new entries while we cannot verify the spread).
+
+     Effect: entries can no longer bypass the spread guard via a
+     missing/malformed bookTicker. During a Binance bookTicker
+     brownout, the bot will simply hold off on new entries until
+     tickers are readable — the correct conservative behaviour.
+
+     Zero change to the happy path (ticker present → same check as
+     before). Only the missing-ticker branch differs.
+
 REV 1.4.43 (2026-10-05) — SCAN BATCH WALL-TIME CAP:
   ✅ The parallel indicator fetch in main_loop() no longer blocks the
      scan cycle indefinitely when one or more workers hang. Previously
@@ -630,6 +692,7 @@ def _reconcile_on_startup():
 
 # ═════════════════════════════════════════════════════════════
 #  REV 1.4.30 — DD KILL-SWITCH (FLATTEN + HALT)
+#  REV 1.4.45 — durable PAUSE_FILE write (fsync + dir fsync).
 # ═════════════════════════════════════════════════════════════
 def _execute_dd_halt(reason: str) -> None:
     if _DD_HALT_FLAG['halted']:
@@ -713,6 +776,21 @@ def _execute_dd_halt(reason: str) -> None:
     except Exception:
         pass
 
+    # ── REV 1.4.45 — durable PAUSE_FILE write. ──
+    # fsync the file AND best-effort the containing directory so the
+    # marker survives a power loss / hard reboot. Without fsync, the
+    # data could sit in the OS page cache and be lost if the machine
+    # dies between `close()` and actual disk flush. Directory fsync
+    # (POSIX-only, no-op on Windows) additionally persists the rename
+    # metadata so the file is discoverable after reboot.
+    #
+    # Note on ordering: the write happens AFTER flattening in the
+    # current design. That is safe — daily_tracker's DD state is
+    # persisted independently to LOSS_FILE, so a crash mid-flatten
+    # still re-trips the kill-switch on the next startup. Only a
+    # crash just before PKT midnight would fail to re-trigger, and
+    # that corner case is deferred to the C2 persist-first
+    # restructuring (post-live-stats).
     try:
         with open(PAUSE_FILE, 'w', encoding='utf-8') as f:
             f.write(
@@ -722,6 +800,18 @@ def _execute_dd_halt(reason: str) -> None:
                 f"closed={closed}\n"
                 f"failed={failed}\n"
             )
+            f.flush()
+            os.fsync(f.fileno())
+        # Best-effort directory fsync (no-op on Windows).
+        try:
+            _dir = os.path.dirname(os.path.abspath(PAUSE_FILE))
+            _dfd = os.open(_dir, os.O_RDONLY)
+            try:
+                os.fsync(_dfd)
+            finally:
+                os.close(_dfd)
+        except (OSError, AttributeError):
+            pass
     except Exception as e:
         logger.critical(f"[DD-HALT] write PAUSE_FILE failed: {e}")
 
@@ -1572,6 +1662,21 @@ def main_loop():
                         trade_side = None
                         skip_reason = "IN POSITION"
 
+                    # ═══════════════════════════════════════════════════
+                    #  REV 1.4.44 — SPREAD FILTER FAIL-CLOSED.
+                    #
+                    #  Previously `if _bt:` — a missing bookTicker for a
+                    #  coin silently skipped the spread check entirely,
+                    #  letting the entry proceed with no spread validation.
+                    #  A delisted-mid-cycle, halted, or freshly-listed
+                    #  symbol could enter during a Binance bookTicker
+                    #  brownout.
+                    #
+                    #  Now: missing `_bt` → skip_reason + block entry.
+                    #  The trade manager still manages any EXISTING
+                    #  position on the coin; this only blocks NEW entries
+                    #  while we cannot verify the spread.
+                    # ═══════════════════════════════════════════════════
                     if trade_side and CC.get("use_spread_filter", True):
                         _bt = book_tickers.get(coin)
                         if _bt:
@@ -1589,6 +1694,16 @@ def main_loop():
                                     f"skipping entry (bid={_bid} ask={_ask})"
                                 )
                                 trade_side = None
+                        else:
+                            # ── REV 1.4.44 — fail-CLOSED on missing ticker. ──
+                            # No bid/ask available → cannot verify spread.
+                            # Reject the entry rather than proceed blind.
+                            skip_reason = "NO TICKER (spread filter)"
+                            logger.warning(
+                                f"[{symbol}] {skip_reason} — skipping "
+                                f"entry (bookTicker unavailable for {coin})"
+                            )
+                            trade_side = None
 
                     if trade_side:
                         est_qty = _compute_est_qty(balance, live_price, lvl['SL'])

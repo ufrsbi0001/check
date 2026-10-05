@@ -1,57 +1,39 @@
 """
 orders/entry.py — Order placement.
 
-REV 1.9.3 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 6):
-  ✅ Migrated all 9 explicit `_requests_lock` sites to `_write_lock`.
-     Every one of them wraps a `futures_create_order` MARKET close:
-       • adverse-slippage flatten
-       • crossed-SL close (sync + retry)
-       • SL -2021 emergency close
-       • tight-branch corrective reduce
-       • wide-branch >50%-of-qty emergency close
-       • wide-branch corrective reduce
-       • post-fix notional below-min close
-       • RR-collapse close
-     All are WRITES — the correct lock is _write_lock.
+REV 1.9.5 (2026-10-05) — SIZING BASE INCLUDES UNREALIZED PNL (H4b):
+  ✅ MEDIUM (H4b): the wallet-balance base used for risk sizing is now
+     `totalMarginBalance` (wallet + unrealized PnL) instead of
+     `totalWalletBalance` (wallet only). Previously, whenever the
+     account held underwater positions, the bot sized NEW entries
+     against an inflated balance that ignored those losses.
 
-     Effect: entry.py's market closes no longer compete with read-only
-     probes (klines, position fetches, account snapshots) for the same
-     lock. With the alias `_requests_lock = _write_lock` in
-     core.client, the migration is behaviour-neutral — but the intent
-     is now explicit and this file is ready for the eventual alias
-     removal.
+     Example: wallet=$4500, open unrealized PnL=-$300. Real equity is
+     $4200, but the old code sized the next trade off $4500 — a ~7%
+     over-size relative to actual capital at risk. Over a losing
+     streak with multiple concurrent positions, this compounds: each
+     new entry assumes capital that has already been lost.
 
-     Note: this file has NO read-lock sites to migrate — every
-     existing explicit lock wraps an order create. The unlocked
-     read calls (futures_position_information, futures_account,
-     futures_get_order inside _resolve_ambiguous_market) are pre-
-     existing behaviour and were NOT changed by this revision.
+     Fix: read `totalMarginBalance` first (this is Binance's canonical
+     "wallet + unrealized" figure and matches what the account cache
+     and DD gate already use, via get_balance_or_last_good). Fallback
+     chain preserves backward compatibility:
+         totalMarginBalance
+         → totalWalletBalance    (older API schemas)
+         → availableBalance      (last-resort, existing behaviour)
 
-     Zero behaviour change. Same lock primitive at each call site.
+     Zero change when the account has no open positions (unrealized
+     PnL == 0 → totalMarginBalance == totalWalletBalance). Zero change
+     for the DD gate, hold-time, or any other logic — this only
+     affects the base used for the per-trade risk calculation.
 
-REV 1.9.2 (2026-10-04) — CRITICAL DOUBLE-ENTRY + SIZING GUARD FIXES:
-  ✅ CRITICAL (C1): `_place_market_idempotent` no longer retries with
-     a FRESH clientOrderId when the ambiguous-market resolver returns
-     status='UNKNOWN'. Previously, if Binance accepted the first order
-     but its ack hadn't propagated by the time the 8s poll gave up,
-     the code generated a new cid and placed a SECOND MARKET order —
-     opening 2× the intended position. Now: fresh cid ONLY on terminal
-     status (CANCELED/EXPIRED/REJECTED). On UNKNOWN, return to caller
-     immediately so the trade is registered as `unverified` and
-     reconciled by the guardian.
-  ✅ CRITICAL (C5): `max_oversize_mult` now reads from a DEDICATED
-     config key `risk_oversize_abort_mult` (default 1.20). Previously
-     it read `risk_oversize_warn_mult` — the same key used for the
-     log-only warn threshold. An operator tuning the warn key up
-     (e.g. to 2.0, thinking it's just logging) silently disabled the
-     sizing abort guard. Requires a matching key in
-     core/config_center.py::GLOBAL — falls back to 1.20 if absent.
-  ✅ CRITICAL (C6): the outer `except` around `_risk_size_with_floor_guard`
-     no longer bumps qty up to `min_qty` on failure. Previously any
-     unexpected exception in the sizing function silently produced an
-     oversized (min-qty) position that bypassed the risk budget. Now
-     the entry is rejected cleanly (`_release_slot(); return False`).
+REV 1.9.4 (2026-10-05) — POST-FILL CRASH SAFETY + HOLD-TIME ORIGIN FIX (retained):
+  ✅ CRITICAL (C3): outer exception handler now flattens any residual
+     position instead of leaving it naked.
+  ✅ HIGH (H2): entry_time stamped AFTER market order, not before.
 
+REV 1.9.3 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 6) (retained).
+REV 1.9.2 (2026-10-04) — CRITICAL DOUBLE-ENTRY + SIZING GUARD FIXES (retained).
 REV 1.9.1 (2026-10-04) — FILTER-BUST RECOMPUTE + MINOR CLEANUP (retained).
 REV 1.9.0 (2026-10-03) — HARDENING PASS (retained).
 REV 1.8.1 (2026-10-03) — ZERO-COERCION FIX (retained).
@@ -587,7 +569,19 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 pass
 
             available = float(account['availableBalance'])
-            wallet_balance = float(account.get('totalWalletBalance', available))
+
+            # ── REV 1.9.5 (H4b) — sizing base includes unrealized PnL. ──
+            # `totalMarginBalance` = wallet + unrealized (what the DD
+            # gate and account cache already use). Fall back to
+            # `totalWalletBalance` on older schemas, then to
+            # `availableBalance` as the last resort.
+            wallet_balance = float(
+                account.get(
+                    'totalMarginBalance',
+                    account.get('totalWalletBalance', available),
+                )
+            )
+
             required_margin = (float(quantity) * entry_price_est) / _leverage
 
             if required_margin > available * _margin_buffer_pct:
@@ -801,7 +795,6 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         sl_price = final_sl_price
 
         close_side = 'SELL' if side == 'BUY' else 'BUY'
-        _shared_entry_time_str = datetime.now(PKT).strftime('%Y-%m-%d %I:%M:%S %p')
         _regime_now, _hold_min = _snapshot_regime(symbol, strategy)
 
         # ═══════════════════════════════════════════════════════════
@@ -815,6 +808,17 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             f"[{symbol}] market entry: status={status} "
             f"exec_qty={exec_qty} avg_price={avg_price} cid={cid_used}"
         )
+
+        # ── REV 1.9.4 (H2) — entry_time stamped HERE, not before ──
+        # Two effects:
+        #   1. Hold-time origin = actual fill moment (used by the
+        #      time-exit path in manage.py::manage_single_trade).
+        #   2. Reconcile's unverified grace window
+        #      (repair.py::_UNVERIFIED_FAST_RECONCILE_SEC = 10s) now
+        #      starts at registration, not ~1-3s earlier. Previously
+        #      the grace was mostly consumed by the time we registered,
+        #      giving reconcile no quiet window on fast fills.
+        _entry_time_str = datetime.now(PKT).strftime('%Y-%m-%d %I:%M:%S %p')
 
         # Definitive reject with no fill → clean up
         if status in ('CANCELED', 'EXPIRED', 'REJECTED') and exec_qty <= 0:
@@ -834,7 +838,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             add_active_trade(symbol, {
                 'entry': entry_price_est, 'qty': qty_str, 'sl': '0',
                 'tp1': '0', 'tp2': '0', 'side': side,
-                'entry_time': _shared_entry_time_str,
+                'entry_time': _entry_time_str,
                 'sl_id': 0, 'sl_level': 0,
                 'unverified': True,
                 'initial_sl': float(sl_price),
@@ -883,7 +887,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             add_active_trade(symbol, {
                 'entry': entry_price_est, 'qty': qty_str, 'sl': '0',
                 'tp1': '0', 'tp2': '0', 'side': side,
-                'entry_time': _shared_entry_time_str,
+                'entry_time': _entry_time_str,
                 'sl_id': 0, 'sl_level': 0,
                 'unverified': True,
                 'initial_sl': float(sl_price),
@@ -907,7 +911,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             add_active_trade(symbol, {
                 'entry': entry_price, 'qty': str(exec_qty), 'sl': '0',
                 'tp1': '0', 'tp2': '0', 'side': side,
-                'entry_time': _shared_entry_time_str,
+                'entry_time': _entry_time_str,
                 'sl_id': 0, 'sl_level': 0,
                 'unverified': True,
                 'initial_sl': float(sl_price),
@@ -1013,7 +1017,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         add_active_trade(symbol, {
             'entry': entry_price, 'qty': qty_str, 'sl': '0',
             'tp1': '0', 'tp2': '0', 'side': side,
-            'entry_time': _shared_entry_time_str,
+            'entry_time': _entry_time_str,
             'sl_id': 0, 'sl_level': 0,
             'unverified': True,
             'initial_sl': float(sl_price),
@@ -1194,7 +1198,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         add_active_trade(symbol, {
             'entry': entry_price, 'qty': qty_str, 'sl': sl_adj,
             'tp1': '0', 'tp2': '0', 'side': side,
-            'entry_time': _shared_entry_time_str,
+            'entry_time': _entry_time_str,
             'sl_id': sl_id, 'sl_level': 0,
             'initial_sl': float(sl_adj),
             'strategy': strategy,
@@ -1575,7 +1579,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         add_active_trade(symbol, {
             'entry': entry_price, 'qty': qty_str, 'sl': sl_adj,
             'tp1': tp1_adj, 'tp2': tp2_adj, 'side': side,
-            'entry_time': _shared_entry_time_str,
+            'entry_time': _entry_time_str,
             'sl_id': sl_id, 'sl_level': 0,
             'initial_sl': float(sl_adj),
             'tp1_id': tp1_id, 'tp2_id': tp2_id,
@@ -1614,9 +1618,62 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         return True
 
     except Exception as e:
+        # ═══════════════════════════════════════════════════════════
+        #  REV 1.9.4 (C3) — POST-FILL CRASH SAFETY NET.
+        #
+        #  If an exception was raised AFTER the market order was
+        #  submitted (anywhere past _place_market_idempotent), the
+        #  position may exist on the exchange with NO SL, NO TP, and
+        #  no bot-tracked record. Previously this handler just logged
+        #  and released the slot, leaving a naked position until the
+        #  next process restart. The orphan-watch would only alert
+        #  (~60s), not adopt (auto_adopt defaults False).
+        #
+        #  Now: probe the exchange for a real position. If one exists
+        #  — or if the probe itself fails (unknown state, assume the
+        #  worst) — launch emergency_close_retry on a background
+        #  thread. That routine uses a deterministic cid, retries up
+        #  to ~40s, and cleans up on success.
+        # ═══════════════════════════════════════════════════════════
         logger.error(
             f"Unexpected error in place_order for {symbol}: {e}",
             exc_info=True,
         )
+        try:
+            _p = fetch_position_raw(symbol)
+            _naked = (
+                _p is None
+                or float(_p.get('positionAmt', 0) or 0) != 0
+            )
+        except Exception:
+            # Cannot determine → conservative: assume filled.
+            _naked = True
+
+        if _naked:
+            _close_side = 'SELL' if side == 'BUY' else 'BUY'
+            logger.critical(
+                f"[{symbol}] exception AFTER possible fill — "
+                f"launching emergency_close_retry "
+                f"(side={_close_side}) to flatten any residual position"
+            )
+            try:
+                threading.Thread(
+                    target=emergency_close_retry,
+                    args=(symbol, pair, _close_side),
+                    daemon=True,
+                ).start()
+            except Exception as _te:
+                logger.error(
+                    f"[{symbol}] could not launch emergency close "
+                    f"thread: {_te} — MANUAL CHECK REQUIRED"
+                )
+            try:
+                send_telegram(
+                    f"🚨 {symbol} entry crashed post-fill — "
+                    f"emergency flatten launched (side={_close_side})"
+                )
+            except Exception:
+                pass
+
         _release_slot()
         return False

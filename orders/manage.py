@@ -1,45 +1,52 @@
 """
 orders/manage.py — Trade management loop.
 
-REV 1.10.4 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 4):
-  ✅ Migrated from the legacy `_requests_lock` (which aliases
-     _write_lock) to the explicit `_read_lock` / `_write_lock` split
-     introduced in core/client.py REV 11.5.
+REV 1.10.5 (2026-10-05) — PARTIAL-70% SL-FIRST REORDER (H6):
+  ✅ HIGH (H6): the partial-70% close path now places the new BE
+     SL BEFORE cancelling the old stops, instead of AFTER. Previously
+     the sequence was:
 
-     Classification applied:
-       • futures_get_open_orders           → _read_lock
-       • futures_position_information      → _read_lock
-       • futures_create_order              → _write_lock
-       • futures_cancel_order              → _write_lock
+        1. Close 70% at market/limit
+        2. Cancel ALL old STOP orders
+        3. Place fresh BE SL for the remaining ~30%
 
-     Effect: the TM thread's read probes no longer serialize against
-     order placements from entry.py / repair.py. A slow position fetch
-     for symbol X cannot stall the BE SL update for symbol Y. Writes
-     still serialize against each other across the whole process.
+     Between steps 2 and 3 there was a 2-4 second window (network
+     round-trips for the reads + cancels) during which the remaining
+     position had NO protective stop on the exchange. If the network
+     hiccuped, or the process died, or BE SL placement failed for
+     any reason, the residual position sat with no stop until the
+     reconcile loop noticed it on the next cycle (or worse, until
+     the next process restart under pathological conditions).
 
-     Zero behaviour change. Only the lock primitive changed at each
-     call site — same code path, same retry semantics, same errors.
+     Fix: swap steps 2 and 3. New BE SL is placed FIRST (with
+     quantity = actual remainder after the 70% close, and reduceOnly
+     = True). Only then are the old stops cancelled, with the new
+     BE SL id explicitly excluded from the cancel sweep. This
+     mirrors the SL-first ordering already used correctly in
+     _detect_tp1_fill_and_move_be().
 
-     The deprecated alias `_requests_lock = _write_lock` still exists
-     in core.client for unmigrated files (entry.py, exit.py, repair.py,
-     web/*). Those continue to work — they just over-serialize until
-     migrated the same way.
+     Momentary overlap: for ~1-2s both the old (full-size) SL and
+     the new (30%-size) BE SL exist on the book. Both are reduceOnly,
+     so:
+       • if old SL triggers first → it closes what remains (the
+         desired outcome — SL hit).
+       • if new BE SL triggers first → it closes 30%, old SL
+         becomes a no-op.
+     Neither overlap path is a safety regression vs the previous
+     naked window.
 
-REV 1.10.3 (2026-10-05) — -2021 SL-SKIP VISIBILITY:
-  ✅ update_sl() now logs -2021 at WARNING instead of DEBUG.
-     -2021 (stop price crossed by mark) is EXPECTED in volatile
-     markets — the pre-check at the top of update_sl() guards the
-     common case, but mark can still move between the check and
-     the order placement. When it does, the OLD SL stays live and
-     valid, so this is not a safety issue.
-     It IS an observability issue: a burst of these means the bot
-     is repeatedly failing to tighten SLs and operators were blind
-     to it (DEBUG is invisible in prod log level INFO). Promoted
-     to WARNING so a slow-moving market that keeps outpacing SL
-     updates is visible in bot.log.
-     Zero behaviour change — same `return False`, same retry path,
-     same old-SL-still-active guarantee.
+     If new BE SL placement FAILS (network, filter, -2021, etc.):
+     we DO NOT cancel the old stops. The old (wider) SL stays live
+     on the exchange, protecting the remainder. Emergency close is
+     still launched as before for the worst case.
 
+     Zero change to the happy path (both orders succeed): same end
+     state, same persisted fields. Only the intermediate state
+     during the ~1-2s placement/cancel sequence is different, and
+     it's strictly safer.
+
+REV 1.10.4 (2026-10-05) — READ/WRITE LOCK MIGRATION (Phase 2, Step 4) (retained).
+REV 1.10.3 (2026-10-05) — -2021 SL-SKIP VISIBILITY (retained).
 REV 1.10.2 (2026-10-04) — ORPHAN-WATCH STARTUP GRACE (retained).
 REV 1.10.1 (2026-10-04) — FAST-RECONCILE + SESSION-LOCK FIXES (retained).
 REV 1.10.0 (2026-10-03) — RACE-SAFE SL LIFECYCLE (retained).
@@ -200,7 +207,16 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
         return
 
     try:
-        for o in _get_open_algo_orders(pair):
+        # ── REV 11.8 (H5b) — _get_open_algo_orders returns None on failure. ──
+        _algo_orders = _get_open_algo_orders(pair)
+        if _algo_orders is None:
+            logger.warning(
+                f"[_detect_tp1_fill] {pair}: algo-order list unreadable — "
+                f"deferring TP1 detection to next cycle (do not assume "
+                f"TP1 is missing)"
+            )
+            return
+        for o in _algo_orders:
             t = (o.get('type') or o.get('orderType') or '').upper()
             if t != 'TAKE_PROFIT_MARKET':
                 continue
@@ -360,6 +376,7 @@ def _detect_tp1_fill_and_move_be(symbol, pair, is_long, cur_amt, active):
 #  manage_single_trade
 #  REV 1.10.4 — every explicit lock site classified:
 #               read probes → _read_lock, order placement → _write_lock.
+#  REV 1.10.5 — partial-70% path now SL-first (H6).
 # ═════════════════════════════════════════════════════════════
 def manage_single_trade(symbol):
     pair = symbol + 'USDT'
@@ -552,6 +569,13 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  PARTIAL 70% (disabled by default)
+    #  REV 1.10.5 (H6) — SL-FIRST reorder:
+    #    1. Determine remainder qty
+    #    2. Place NEW BE STOP_MARKET for remainder (write lock)
+    #    3. Cancel old STOPs (excluding new BE id)
+    #    4. Persist state
+    #  Previously steps 3 and 2 were swapped, leaving a 2-4s naked
+    #  window on the ~30% residual position. See module docstring.
     # ═══════════════════════════════════════════════════════════
     try:
         unrealized_usdt = float(raw_pos.get('unRealizedProfit', '0') or 0)
@@ -602,6 +626,7 @@ def manage_single_trade(symbol):
                     limit_price_adj = adjust_price(limit_price, tick)
                     filled = False
 
+                    # ── STEP 1: close 70% (unchanged — this part was never the issue). ──
                     try:
                         # ── REV 1.10.4 — write lock. ──
                         with _write_lock:
@@ -671,57 +696,42 @@ def manage_single_trade(symbol):
                     except Exception:
                         pass
 
-                    # Cancel old STOPS so we can place a fresh BE
-                    try:
-                        # ── REV 1.10.4 — read probe then write cancels. ──
-                        with _read_lock:
-                            oo = client.futures_get_open_orders(symbol=pair)
-                        for o in oo:
-                            otype = (o.get('type') or '').upper()
-                            if 'STOP' in otype \
-                                    and otype != 'TAKE_PROFIT_MARKET':
-                                try:
-                                    with _write_lock:
-                                        client.futures_cancel_order(
-                                            symbol=pair,
-                                            orderId=o['orderId'],
-                                        )
-                                except Exception as _pe:
-                                    logger.warning(f"[manage_single_trade] ignored API error: {type(_pe).__name__}: {_pe}")
-                    except Exception as _pe:
-                        logger.warning(f"[manage_single_trade] ignored API error: {type(_pe).__name__}: {_pe}")
-                    try:
-                        from core.client import _cancel_algo_order as _ca
-                        for o in _get_open_algo_orders(pair):
-                            otype = (
-                                o.get('type') or o.get('orderType') or ''
-                            ).upper()
-                            if 'STOP' in otype and 'TAKE_PROFIT' not in otype:
-                                oid = o.get('algoId') or o.get('orderId')
-                                if oid:
-                                    # _cancel_algo_order internally acquires
-                                    # _write_lock (REV 11.5) — no outer lock.
-                                    _ca(pair, oid)
-                    except Exception:
-                        pass
+                    # ═══════════════════════════════════════════════════
+                    #  REV 1.10.5 (H6) — SL-FIRST REORDER.
+                    #
+                    #  Old order:  cancel old stops → place new BE.
+                    #  New order:  place new BE → cancel old stops
+                    #              (excluding the new BE).
+                    #
+                    #  The old order had a 2-4s window (reads + cancels)
+                    #  during which the ~30% remainder had NO stop on
+                    #  the exchange. New order keeps the old (wider) SL
+                    #  live until the new BE is confirmed on the book.
+                    #
+                    #  Momentary overlap (~1s) is harmless: both stops
+                    #  are reduceOnly, so whichever triggers first wins.
+                    # ═══════════════════════════════════════════════════
 
-                    # BE SL for remainder
-                    try:
-                        cur_qty_rem = None
-                        for _ in range(3):
-                            time.sleep(0.5)
-                            fp = fetch_position_raw(symbol)
-                            if fp:
-                                q = abs(
-                                    float(fp.get('positionAmt', '0') or 0)
-                                )
-                                if q > 0:
-                                    cur_qty_rem = q
-                                    break
-                        if cur_qty_rem is None:
-                            cur_qty_rem = abs(float(amt)) * 0.30
+                    # ── STEP 2a: determine actual remainder qty. ──
+                    cur_qty_rem = None
+                    for _ in range(3):
+                        time.sleep(0.5)
+                        fp = fetch_position_raw(symbol)
+                        if fp:
+                            q = abs(
+                                float(fp.get('positionAmt', '0') or 0)
+                            )
+                            if q > 0:
+                                cur_qty_rem = q
+                                break
+                    if cur_qty_rem is None:
+                        cur_qty_rem = abs(float(amt)) * 0.30
 
-                        if cur_qty_rem > 0:
+                    # ── STEP 2b: place NEW BE SL FIRST. ──
+                    be_id = None
+                    be_adj = None
+                    if cur_qty_rem > 0:
+                        try:
                             if r_mode:
                                 partial_r = r_th["partial_stop_r"]
                                 be_sl_tmp = (
@@ -734,7 +744,6 @@ def manage_single_trade(symbol):
                                     else entry * 0.9992
                                 )
                             be_adj = adjust_price(be_sl_tmp, tick)
-                            # ── REV 1.10.4 — write lock. ──
                             with _write_lock:
                                 resp_be = client.futures_create_order(
                                     symbol=pair, side=close_side,
@@ -754,31 +763,104 @@ def manage_single_trade(symbol):
                                 resp_be.get('orderId')
                                 or resp_be.get('algoId')
                             )
-                            fresh2 = dict(get_active_trade(symbol) or {})
-                            if fresh2:
-                                fresh2['sl'] = be_adj
-                                fresh2['sl_id'] = be_id
-                                fresh2['sl_level'] = 1
-                                add_active_trade(symbol, fresh2)
-                    except Exception as e:
-                        logger.error(
-                            f"[{symbol}] partial->BE SL FAILED: {e} "
-                            f"- emergency close"
-                        )
-                        try:
-                            send_telegram(
-                                f"🚨 {symbol} BE SL failed after partial - "
-                                f"emergency close 30%"
+                            if not be_id:
+                                raise ValueError(
+                                    "BE SL placement returned no orderId"
+                                )
+                        except Exception as e:
+                            # ── BE SL placement failed → old stops are
+                            # still live (we haven't cancelled them yet),
+                            # so the remainder is NOT naked. Emergency
+                            # close as a last resort for the worst case.
+                            logger.error(
+                                f"[{symbol}] partial->BE SL FAILED: {e} "
+                                f"- emergency close (old SL may still be "
+                                f"live on exchange)"
                             )
-                        except Exception:
-                            pass
-                        try:
-                            threading.Thread(
-                                target=emergency_close_retry,
-                                args=(symbol, pair, close_side), daemon=True,
-                            ).start()
-                        except Exception:
-                            pass
+                            try:
+                                send_telegram(
+                                    f"🚨 {symbol} BE SL failed after "
+                                    f"partial - emergency close 30%"
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                threading.Thread(
+                                    target=emergency_close_retry,
+                                    args=(symbol, pair, close_side),
+                                    daemon=True,
+                                ).start()
+                            except Exception:
+                                pass
+                            return
+
+                    # ── STEP 3: NEW BE SL is live. NOW cancel old stops,
+                    #           excluding the new BE id. ──
+                    try:
+                        # ── REV 1.10.4 — read probe then write cancels. ──
+                        with _read_lock:
+                            oo = client.futures_get_open_orders(symbol=pair)
+                        for o in oo:
+                            otype = (o.get('type') or '').upper()
+                            if 'STOP' in otype \
+                                    and otype != 'TAKE_PROFIT_MARKET':
+                                oid = o.get('orderId')
+                                # Skip the new BE we just placed.
+                                if be_id is not None and \
+                                        str(oid) == str(be_id):
+                                    continue
+                                try:
+                                    with _write_lock:
+                                        client.futures_cancel_order(
+                                            symbol=pair,
+                                            orderId=oid,
+                                        )
+                                except Exception as _pe:
+                                    logger.warning(f"[manage_single_trade] ignored API error: {type(_pe).__name__}: {_pe}")
+                    except Exception as _pe:
+                        logger.warning(f"[manage_single_trade] ignored API error: {type(_pe).__name__}: {_pe}")
+
+                    try:
+                        from core.client import _cancel_algo_order as _ca
+                        _algo_list = _get_open_algo_orders(pair)
+                        if _algo_list is None:
+                            logger.warning(
+                                f"[{symbol}] partial: algo-order list "
+                                f"unreadable — skipping algo cancel sweep "
+                                f"(new BE {be_id} unaffected; old algo "
+                                f"stops may linger, will be reconciled)"
+                            )
+                        else:
+                            for o in _algo_list:
+                                otype = (
+                                    o.get('type') or o.get('orderType') or ''
+                                ).upper()
+                                if 'STOP' in otype \
+                                        and 'TAKE_PROFIT' not in otype:
+                                    oid = (
+                                        o.get('algoId') or o.get('orderId')
+                                    )
+                                    if not oid:
+                                        continue
+                                    # Skip the new BE we just placed.
+                                    if be_id is not None and \
+                                            str(oid) == str(be_id):
+                                        continue
+                                    # _cancel_algo_order internally
+                                    # acquires _write_lock (REV 11.5) —
+                                    # no outer lock.
+                                    _ca(pair, oid)
+                    except Exception:
+                        pass
+
+                    # ── STEP 4: persist state. ──
+                    if be_id and be_adj:
+                        fresh2 = dict(get_active_trade(symbol) or {})
+                        if fresh2:
+                            fresh2['sl'] = be_adj
+                            fresh2['sl_id'] = be_id
+                            fresh2['sl_level'] = 1
+                            add_active_trade(symbol, fresh2)
                     return
                 except Exception as e:
                     logger.error(f"[{symbol}] partial 70% close failed: {e}")
