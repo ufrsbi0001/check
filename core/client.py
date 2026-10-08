@@ -281,7 +281,7 @@ _TS_TTL = 60.0
 #     8 workers.
 #
 #   REV 11.7: BOTH pools now floor the effective wait at the HTTP
-#   session timeout (10s). Previously best-effort was capped at 6s,
+#   session timeout (30s). Previously best-effort was capped at 6s,
 #   which caused the CALLER to give up while the WORKER was still in
 #   flight — still holding _read_lock for up to the full session
 #   timeout. The cap only gave the illusion of a shorter wait.
@@ -299,7 +299,7 @@ _CRITICAL_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 # session timeout configured in set_client_keys(). A caller that
 # requests less is lifted to it; a caller that requests more is
 # honored as-is.
-_CRITICAL_MIN_TIMEOUT = 10.0
+_CRITICAL_MIN_TIMEOUT = 30.0
 
 # REV 11.3 (A1) — desc prefixes that route to the critical pool.
 # Matches the caller conventions in entry.py / manage.py / exit.py.
@@ -348,7 +348,7 @@ def _run_with_timeout(fn, timeout, desc="api_call"):
     failure. Both pools share the same effective-timeout floor.
 
     Effective timeout for BOTH pools:
-        effective = max(timeout, _CRITICAL_MIN_TIMEOUT)   # ≥10s
+        effective = max(timeout, _CRITICAL_MIN_TIMEOUT)   # ≥30s
     The floor equals the HTTP session timeout (set_client_keys),
     so we NEVER give up on a worker before the socket layer does.
     This applies to best-effort callers too — see REV 11.7 (A) note
@@ -578,7 +578,7 @@ def get_account_cached() -> dict:
     REV 11.3 (A1) — non-critical; runs on best-effort pool.
     REV 11.5 — account fetch is a read → _read_lock.
     REV 11.7 — best-effort floor is now the full session timeout
-    (10s), not 6s. See module docstring REV 11.7 (A).
+    (30s), not 6s. See module docstring REV 11.7 (A).
     """
     with _ACCOUNT_CACHE_LOCK:
         if _ACCOUNT_CACHE['data'] is not None and \
@@ -662,7 +662,7 @@ def _get_exchange_info() -> dict:
                 with _read_lock:
                     return _global_client.futures_exchange_info()
             # REV 11.3 (A1) — non-critical desc → best-effort pool.
-            # REV 11.7 — effective timeout now 10s (session timeout floor).
+            # REV 11.7 — effective timeout now 30s (session timeout floor).
             info = _run_with_timeout(_fetch, 6, "exchange_info")
             with _EXCHANGE_INFO_LOCK:
                 _EXCHANGE_INFO_CACHE['data'] = info
@@ -1425,7 +1425,7 @@ def set_client_keys(api_key: str, api_secret: str) -> Client:
         raise ValueError("API key/secret too short")
 
     with _CLIENT_INIT_LOCK:
-        client_params = {'requests_params': {'timeout': 10}}
+        client_params = {'requests_params': {'timeout': 30}}
         if CONFIG.demo_mode:
             _global_client = Client(api_key, api_secret, demo=True, **client_params)
             logger.info("DEMO MODE ACTIVE - demo.binance.com")
@@ -1435,6 +1435,7 @@ def set_client_keys(api_key: str, api_secret: str) -> Client:
         else:
             _global_client = Client(api_key, api_secret, **client_params)
             logger.warning("MAINNET MODE - REAL MONEY!")
+        _global_client.recvWindow = 15000   # <--- YEH LINE ADD KAREIN
         _install_pooled_session(_global_client)
 
     refresh_timestamp()

@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════
-   OBSIDIAN PRO v4.1 — PIXEL-PERFECT EDITION
+   OBSIDIAN PRO v5.0 — PRECISION EDITION
    Refined: 4px grid · unified easing · harmonized radii
             balanced glow budget · typography scale · micro-polish
    ══════════════════════════════════════════════════════════════ */
@@ -10,7 +10,7 @@
   --bg-raised:#0d1016;
   --bg-elevated:#141824;
   --bg-hover:rgba(255,255,255,.03);
-  --bg-glass:rgba(7,8,12,.82);
+  --bg-glass:rgba(7,8,12,.92);
 
   /* ── hairlines ── */
   --line-soft:rgba(255,255,255,.04);
@@ -22,8 +22,8 @@
   --ink:#f4f7fc;
   --ink-2:#ccd4e2;
   --ink-dim:#8e9bb1;
-  --ink-faint:#6b7689;
-  --ink-mute:#4a5162;
+  --ink-faint:#7b869b;   /* was #6b7689 — lifted for AA contrast on dark */
+  --ink-mute:#5f687b;    /* was #4a5162 — was ~2.6:1, now readable */
 
   /* ── accents ── */
   --gold:#e0b868;
@@ -80,6 +80,8 @@
   --dur-slow:.34s;
   --ease:cubic-bezier(.22,.75,.28,1);
   --ease-spring:cubic-bezier(.34,1.4,.5,1);
+  --focus-ring:0 0 0 2px var(--bg),0 0 0 4px var(--gold);
+  color-scheme:dark;
 
   /* ── fonts ── */
   --font-display:'Space Grotesk',Inter,system-ui,sans-serif;
@@ -107,18 +109,17 @@ body{
   -moz-osx-font-smoothing:grayscale;
   text-rendering:optimizeLegibility;
   overflow-x:hidden;
-  min-height:100vh;
+  min-height:100vh;min-height:100dvh;
 }
+/* FIX: was inset:-25% — could create phantom scroll area in some WebViews/Safari */
 body::after{
   content:'';
-  position:fixed;inset:-25%;z-index:-2;pointer-events:none;
+  position:fixed;inset:0;z-index:-2;pointer-events:none;
   background:
     radial-gradient(1000px 520px at 4% -14%, rgba(224,184,104,.08), transparent 60%),
     radial-gradient(800px 460px at 98% -2%,  rgba(13,214,138,.05),  transparent 60%),
     radial-gradient(900px 620px at 50% 122%, rgba(116,174,232,.045),transparent 62%),
     radial-gradient(600px 400px at 20% 60%,  rgba(255,66,114,.02),  transparent 65%);
-  animation:aurora 24s ease-in-out infinite alternate;
-  will-change:transform;
 }
 @keyframes aurora{
   0%  {transform:translate3d(0,0,0) scale(1)}
@@ -135,7 +136,7 @@ body::before{
   mask-image:radial-gradient(ellipse 90% 60% at 50% 0%,#000 18%,transparent 100%);
   -webkit-mask-image:radial-gradient(ellipse 90% 60% at 50% 0%,#000 18%,transparent 100%);
 }
-::selection{background:var(--gold-soft);color:var(--gold-bright)}
+::selection{background:rgba(224,184,104,.28);color:#fff}
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{
     animation-duration:.001ms!important;
@@ -159,9 +160,8 @@ button{font-family:inherit;color:inherit;background:none;border:none;cursor:poin
 *:focus-visible{
   outline:2px solid var(--gold);
   outline-offset:2px;
-  border-radius:6px;
-  box-shadow:0 0 0 4px rgba(224,184,104,.14);
 }
+input:focus-visible,.search-input:focus-visible{outline-offset:0}
 input,button{caret-color:var(--gold)}
 
 .sr-only{
@@ -172,12 +172,11 @@ input,button{caret-color:var(--gold)}
 /* ══════════════════════════════════════════════════════════════
    HEADER — glass + animated gradient hairline
    ══════════════════════════════════════════════════════════════ */
-header{position:sticky;top:0;z-index:30}
+header,header.header-blur{position:sticky;top:0;z-index:30}
 .header-blur{
-  position:relative;
   background:var(--bg-glass);
-  backdrop-filter:blur(26px) saturate(1.7);
-  -webkit-backdrop-filter:blur(26px) saturate(1.7);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
   border-bottom:1px solid var(--line);
   box-shadow:0 10px 32px -16px rgba(0,0,0,.7);
 }
@@ -189,8 +188,7 @@ header{position:sticky;top:0;z-index:30}
     rgba(13,214,138,.28) 55%,
     rgba(116,174,232,.3) 78%,
     transparent 100%);
-  background-size:200% 100%;
-  animation:headerline 8s linear infinite;
+  background-size:200% 100%;background-position:50% 0;
 }
 @keyframes headerline{
   0%  {background-position:200% 0}
@@ -212,7 +210,6 @@ header{position:sticky;top:0;z-index:30}
   border:1px solid var(--line-gold);
   display:flex;align-items:center;justify-content:center;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 10px 28px -12px rgba(224,184,104,.7);
-  animation:breathe 4s ease-in-out infinite;
   position:relative;overflow:hidden;
   isolation:isolate;
 }
@@ -220,9 +217,9 @@ header{position:sticky;top:0;z-index:30}
   content:'';position:absolute;inset:0;
   background:linear-gradient(115deg,transparent 30%,rgba(255,255,255,.22) 50%,transparent 70%);
   background-size:250% 100%;
-  animation:sheen 3.6s ease-in-out infinite;
   pointer-events:none;
 }
+.brand-mark:hover::before{animation:sheen 1.2s ease-in-out}
 @keyframes sheen{
   0%   {background-position:200% 0}
   60%,100%{background-position:-200% 0}
@@ -246,13 +243,18 @@ header{position:sticky;top:0;z-index:30}
   -webkit-background-clip:text;background-clip:text;color:transparent;
 }
 
+/* FIX: added touch-action + overscroll-behavior-x so vertical page scroll
+   isn't swallowed by this horizontal strip on touch devices */
 .header-meta-scroll{
   flex:1 1 auto;min-width:0;
   overflow-x:auto;overflow-y:hidden;
+  overscroll-behavior-x:contain;
+  touch-action:pan-x pan-y;
+  -webkit-overflow-scrolling:touch;
   scrollbar-width:none;-ms-overflow-style:none;
 }
 .header-meta-scroll::-webkit-scrollbar{display:none}
-.header-meta{display:flex;align-items:center;gap:6px;min-width:max-content;padding:0 2px}
+.header-meta{display:flex;align-items:center;gap:6px;min-width:max-content;padding:6px 4px}
 
 .header-actions{display:flex;align-items:center;gap:var(--sp-3);flex-shrink:0;min-width:0}
 
@@ -503,7 +505,7 @@ main{
 .stat:hover .shimmer{animation:sheen .9s var(--ease)}
 .stat:hover{
   border-color:color-mix(in srgb,var(--accent) 45%,transparent);
-  transform:translateY(-3px);
+  transform:translateY(-2px);
   box-shadow:var(--shadow-md);
 }
 .stat:hover::before{
@@ -567,7 +569,7 @@ main{
 .risk-bar-fill::after,.ratio-bar-fill::after{
   content:'';position:absolute;inset:0;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);
-  animation:barflow 2.4s linear infinite;
+  animation:barflow 2.4s linear infinite;animation-play-state:paused;
 }
 @keyframes barflow{
   0%  {transform:translateX(-100%)}
@@ -600,7 +602,7 @@ main{
 .stat-hoverable.popover-open .stat-popover{
   opacity:1;visibility:visible;transform:translateY(-50%) translateX(0);pointer-events:auto;
 }
-@media(max-width:1399px){
+@media(max-width:1400px){
   .stat-popover{top:calc(100% + 12px);right:0;left:auto;transform:translateY(6px)}
   .stat-popover::after{top:-6px;right:24px;left:auto;transform:rotate(225deg)}
   .stat-hoverable:hover .stat-popover,
@@ -929,14 +931,21 @@ main{
 /* ══════════════════════════════════════════════════════════════
    TABLES
    ══════════════════════════════════════════════════════════════ */
-.table-wrap{overflow-x:auto;scrollbar-width:thin;position:relative}
+/* FIX: horizontal scroll on tables now only contains X —
+   vertical wheel/touch propagates to page so scroll doesn't get stuck */
+.table-wrap{
+  overflow-x:auto;overflow-y:visible;
+  overscroll-behavior-x:contain;
+  touch-action:pan-x pan-y;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-width:thin;position:relative;
+}
 .table-pro{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
 .table-pro thead th{
   position:sticky;top:0;z-index:2;
   height:var(--h-table-head);padding:0!important;
   vertical-align:middle!important;text-align:left;
-  background:rgba(9,11,16,.97);
-  backdrop-filter:blur(10px);
+  background:#090b10;
   color:var(--ink-faint);
   font-size:9.5px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
   white-space:nowrap;
@@ -997,8 +1006,8 @@ main{
 #tab-scanner td:first-child .cell-inner{padding-left:var(--sp-5)}
 #tab-scanner th:last-child .th-inner,
 #tab-scanner td:last-child .cell-inner{padding-right:var(--sp-4)}
-#tab-scanner .chip.chip-mini{min-width:58px;height:20px;padding:0 7px;font-size:8.5px}
-#tab-scanner .badge{min-width:54px;height:20px;padding:0 6px;font-size:9px;letter-spacing:.04em}
+#tab-scanner .chip.chip-mini{min-width:58px;height:20px;padding:0 7px;font-size:9.5px}
+#tab-scanner .badge{min-width:54px;height:20px;padding:0 6px;font-size:9.5px;letter-spacing:.04em}
 #tab-scanner .adx-pill{min-width:42px;height:22px;padding:0 7px;font-size:11px}
 #tab-scanner .conf-track{width:42px}
 
@@ -1086,8 +1095,13 @@ main{
   box-shadow:0 0 10px rgba(224,184,104,.8);
 }
 
+/* FIX: log-box vertical scroll now propagates to page when it hits its own
+   end, instead of trapping the wheel/touch gesture */
 .log-box{
   height:min(470px,58vh);overflow-y:auto;
+  overscroll-behavior-y:auto;
+  touch-action:pan-y;
+  -webkit-overflow-scrolling:touch;
   padding:var(--sp-4) var(--sp-5);
   background:linear-gradient(180deg,rgba(224,184,104,.02),transparent 40px),var(--bg-inset);
   font-size:11.5px;line-height:1.95;color:var(--ink-dim);
@@ -1200,11 +1214,6 @@ td .val.faint-val[title]:hover{color:var(--gold)}
   background:var(--bg-inset);color:var(--ink-faint);
 }
 
-#pnl-spark{
-  display:block;width:100%;height:30px;margin-top:8px;opacity:.95;
-  filter:drop-shadow(0 0 8px rgba(224,184,104,.15));
-}
-
 /* SCANNER ROW STATES */
 #tab-scanner tr[data-action*="EXECUTED"] td{
   background:linear-gradient(90deg,rgba(13,214,138,.08) 0%,transparent 60%)!important;
@@ -1229,7 +1238,7 @@ td .val.faint-val[title]:hover{color:var(--gold)}
    ══════════════════════════════════════════════════════════════ */
 @media(max-width:1500px){
   #tab-scanner .table-pro{min-width:1300px}
-  .chip.chip-mini{min-width:54px;font-size:8.5px}
+  .chip.chip-mini{min-width:54px;font-size:9.5px}
 }
 @media(max-width:1200px){#tab-scanner .table-pro{min-width:1220px}}
 @media(max-width:900px){
@@ -1552,4 +1561,90 @@ body { min-height: 100vh; }
   .te-control-card { gap: 10px; padding: 10px 12px; }
   .te-control-card .te-save { margin-left: 0; }
   .te-control-card .te-title { font-size: 10px; }
+}
+
+
+/* ══════════════════════════════════════════════════════════════
+   v5.0 REFINEMENT LAYER
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Popover was clipped by .stat{overflow:hidden}; let it escape ── */
+.stat.stat-hoverable{overflow:visible}
+.stat .shimmer{border-radius:inherit;overflow:hidden}
+
+.stat.stat-hoverable:hover,
+.stat.stat-hoverable:focus-visible,
+.stat.stat-hoverable.popover-open{z-index:5}
+.tab-panel:focus-visible{outline-offset:-2px}
+
+/* ── Bar shimmer only while the card is hovered (saves constant repaint) ── */
+.stat:hover .risk-bar-fill::after,
+.stat:hover .ratio-bar-fill::after{animation-play-state:running}
+
+/* ── Keep numbers from jittering ── */
+.pnl-pos,.pnl-neg,.stat-value,.table-pro td{font-variant-numeric:tabular-nums}
+
+/* ── Table: keyboard / row focus ── */
+.table-pro tbody tr:focus-within td{background:rgba(224,184,104,.06)}
+.table-pro tbody tr{outline-offset:-2px}
+
+/* ── Firefox-only scrollbar colour (Chrome keeps the gold gradient thumb) ── */
+@supports not selector(::-webkit-scrollbar){
+  *{scrollbar-color:rgba(224,184,104,.3) transparent}
+}
+
+/* ── Modal: never taller than the screen ──
+   FIX: only the Y axis contains — X still lets nothing else leak,
+   and page underneath isn't affected because modal is a fixed overlay. */
+.modal-card{
+  max-height:calc(100dvh - 32px);
+  overflow-y:auto;
+  overscroll-behavior-y:contain;
+  -webkit-overflow-scrolling:touch;
+}
+
+/* ── Fallback when color-mix() is unsupported ── */
+@supports not (color:color-mix(in srgb,red 50%,blue)){
+  .stat:hover{border-color:var(--line-gold)}
+  .stat:hover .stat-value{text-shadow:0 0 24px var(--gold-glow)}
+}
+
+/* ── Notched phones ── */
+@supports (padding:max(0px)){
+  .header-inner{
+    padding-left:max(var(--sp-6),env(safe-area-inset-left));
+    padding-right:max(var(--sp-6),env(safe-area-inset-right));
+  }
+  .toast-container{
+    bottom:max(20px,env(safe-area-inset-bottom));
+    right:max(20px,env(safe-area-inset-right));
+  }
+}
+
+/* ── Mobile ──
+   FIX: tabs-strip now contains X overscroll and allows pan-x/pan-y
+   so finger drag on tabs doesn't lock page scroll. */
+@media(max-width:680px){
+  .tabs-wrap{
+    flex-wrap:nowrap;overflow-x:auto;max-width:100%;
+    overscroll-behavior-x:contain;
+    touch-action:pan-x pan-y;
+    -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;
+  }
+  .tabs-wrap::-webkit-scrollbar{display:none}
+  .tab-btn{flex-shrink:0}
+  .header-inner{padding-left:var(--sp-3);padding-right:var(--sp-3)}
+}
+@media(hover:none) and (pointer:coarse){
+  .btn{height:38px}
+  .btn-close-position{height:30px;padding:0 12px}
+  .stat:hover{transform:none}
+  .panel:hover{box-shadow:var(--shadow-md)}
+}
+
+/* ── Forced colors (Windows high contrast) ── */
+@media(forced-colors:active){
+  .btn,.btn-ghost,.tab-btn,.chip,.badge,.panel,.stat{border:1px solid CanvasText}
+  .tab-btn.active{outline:2px solid Highlight}
 }

@@ -1,6 +1,173 @@
 """
 orders/entry.py — Order placement.
 
+REV 1.9.10 (2026-10-08) — MIN-NOTIONAL CEIL + READ-LOCK COMPLETION:
+  ✅ CRITICAL: min_notional floor/bump now CEIL to next step, not floor.
+     Previously coarse-step coins (e.g. step=0.1, price=33,
+     min_notional=$5) produced qty=0.1 → notional $3.30 < $5 →
+     silent abort of otherwise-valid trades ("Still below min notional,
+     aborting"). Reproduced with:
+         min_notional=5, price=33, step=0.1, bump_mult=1.02
+         qty = 5/33 * 1.02 = 0.154545
+         old: floor to 0.1  → 0.1*33 = $3.30  ✗
+         new: ceil  to 0.2  → 0.2*33 = $6.60  ✓
+     Fix applied in TWO places:
+       • _risk_size_with_floor_guard: floor_qty now ceils
+       • place_order_fixed min_notional bump: qty_dec now ceils
+     NOTE: the max_qty cap still FLOORS (rounds down) — that path
+     must never exceed the exchange ceiling.
+
+  ✅ HIGH: futures_account / futures_position_information /
+     futures_change_margin_type / futures_change_leverage now wrapped
+     in _read_lock / _write_lock respectively, completing the
+     REV 1.9.3 lock migration. requests.Session is not thread-safe;
+     without these locks, the entry thread and trade-manager
+     background thread could corrupt the connection pool.
+
+REV 1.9.8 (2026-10-08) — PRE-ENTRY RR GUARD (RR_COLLAPSE FIX):
+  ✅ CRITICAL: predict post-cap RR BEFORE sending the market order.
+     If the coin's TP1 cap + the signal's SL distance make min_rr
+     mathematically impossible, SKIP the trade — never enter and
+     then flatten on the post-fill RR_COLLAPSE check.
+
+     Root cause (TRUMP, DOT, RENDER on 2026-10-06/07):
+       • Signal engine emits wide ATR-based SL (e.g. 8.9% on TRUMP).
+       • Coin's TP1 cap (coins_config.get_caps) is tighter (e.g. 9.7%).
+       • Post-cap RR = 9.7/8.9 = 1.09 < min_rr 1.50 → COLLAPSE.
+       • Old flow: enter → place SL → cap TP → RR check fails →
+         immediate flatten. Paid spread + taker fees twice, and the
+         strategy often re-emitted the same signal → churn.
+
+     New flow: guard detects the impossibility pre-entry, releases
+     the slot, returns False — no order is ever sent. Zero churn.
+
+     Fail-open: if the guard itself raises, log a warning and
+     proceed with the entry. A missed guard is preferable to a
+     skipped valid trade. Downstream RR_COLLAPSE check remains as
+     defence-in-depth for the (rare) case where realised slippage
+     pushes a borderline-tolerable RR below the floor.
+
+REV 1.9.9 (2026-10-08) — WRITE-LOCK ON 4 ORDER-PLACEMENT SITES:
+  ✅ CRITICAL: every futures_create_order call now runs inside
+     `_write_lock`. Previously 4 sites ran without it:
+       • _place        (market entry)
+       • _place_sl     (initial STOP_MARKET)
+       • _place_tp1    (TAKE_PROFIT_MARKET #1)
+       • _place_tp2    (TAKE_PROFIT_MARKET #2)
+     These calls are dispatched through _run_with_timeout, which
+     spawns a worker thread via a ThreadPoolExecutor. Without the
+     lock, the entry worker and the trade-manager background thread
+     could concurrently use the same requests.Session, corrupting
+     the connection pool or interleaving order responses.
+
+     Safety: _run_with_timeout does NOT acquire _write_lock itself
+     (verified in core/client.py REV 11.7). _write_lock is an
+     RLock (core/client.py line 233), so same-thread re-entry is
+     safe. No deadlock risk — worker simply waits its turn if the
+     trade manager holds the lock, which is the correct behavior.
+
+REV 1.9.7 (2026-10-05) — BINANCE 36-CHAR CLIENT-ORDER-ID FIX:
+  ✅ CRITICAL: `_client_order_id` previously produced cids up to 38
+     chars for 12-char symbols (1000SHIBUSDT, 1000BONKUSDT,
+     1000FLOKIUSDT, 1000PEPEUSDT, PUMPBTCUSDT, ...). Binance rejects
+     any newClientOrderId > 36 chars with -4015, so every market entry
+     on those coins was silently REJECTED. Observed live at 18:09:15
+     on 2026-10-05:
+         [1000SHIBUSDT] market order rejected:
+           APIError(code=-4015): Client order id length should be
+           less than 36 chars
+     Fix (two parts, both inside `_client_order_id`):
+       1. Strip the trailing 'USDT' from the symbol portion — the
+          Binance API always pairs the cid with a `symbol=` param on
+          lookup, so the suffix was redundant.
+       2. Reduce uuid hex from 16 → 14 chars (2^56 entropy per
+          attempt — still astronomically collision-free).
+     New worst-case cid lengths:
+         tb_entry_1000SHIB_<14hex>   = 32 chars
+         tb_entry_1000FLOKI_<14hex>  = 33 chars
+         tb_entry_PUMPBTC_<14hex>    = 31 chars
+     All safely under the 36-char ceiling. SL/TP inline cids were
+     already compliant (max 32) and are untouched.
+
+REV 1.9.6 (2026-10-05) — STALE-SIGNAL SLIPPAGE GUARD + POST-FLATTEN COOLDOWN:
+  ✅ CRITICAL (G1): the post-fill adverse-slippage check no longer
+     fires on STALE signals. Root cause of the CRV churn loop observed
+     in production (2026-10-05):
+
+       The strategy emits a signal at price P_sig. By the time the
+       order reaches the exchange, the price has already drifted to
+       P_est (pre-check validated this gap as ≤ signal_drift_pct).
+       The MARKET fill then lands at P_fill ≈ P_est + spread.
+
+       The old check compared P_fill against P_sig and flattened
+       whenever the TOTAL drift exceeded max_fill_slippage_pct — even
+       though the pre-entry portion of that drift had ALREADY been
+       validated by the SIGNAL DRIFT REJECT gate.
+
+       Concrete failure (CRV, 2026-10-05, ~16:30):
+         signal=0.380200  est=0.381700  fill=0.382200
+         adverse_vs_signal = +0.526%   > 0.500%   → flatten
+         adverse_vs_est    = +0.131%   << 0.500%   (fine!)
+       The signal was ~1-3s stale; the strategy kept re-emitting the
+       SAME signal on every scan (its own internal throttle did not
+       cooldown after flatten), so the bot entered and immediately
+       flattened ~6 times in 3 minutes, bleeding balance from
+       spread + taker fees each cycle.
+
+     Fix: the post-fill check now decides which reference price to
+     use based on how stale the signal was at order time:
+
+       sig_est_gap = |entry_price_est - signal_price| / signal_price
+
+       • If sig_est_gap > 50% of max_fill_slippage_pct → signal is
+         effectively stale. Use drift-vs-EST (measures execution
+         slippage only). This is the correct metric — pre-entry
+         drift was already validated by the drift gate above.
+       • Otherwise → signal is fresh. Keep the original drift-vs-
+         SIGNAL behaviour (catches fills that slipped beyond both
+         estimates).
+
+     Zero change when the signal is fresh. Only the stale-signal
+     path changes, which is exactly the case that was broken.
+
+  ✅ CRITICAL (G2): after a slippage-flatten, set a cooldown on the
+     symbol. Without it, the next scan (15-30s later) re-emits the
+     same still-active signal and immediately re-enters the same
+     churning trade. Cooldown length is configurable via
+     `cooldown_after_slippage_min` (default 5 min); it uses the
+     existing `cooldown_until` dict from core.state, so no new
+     state, no new locks, and the entry guard at the top of
+     place_order_fixed already honours it.
+
+     This is the DEFENCE-IN-DEPTH layer: even if G1's freshness
+     heuristic is imperfect for a future symbol, the cooldown
+     guarantees no more than one slippage-flatten per symbol per
+     cooldown window.
+
+  ✅ NEW (G2b) — ENV-FIRST COOLDOWN READ:
+     Observed in production (2026-10-05 17:16): config_center rejected
+     the new key with
+         "[config_center] ⚠️ env override IGNORED:
+          CC_COOLDOWN_AFTER_SLIPPAGE_MIN='5' — key
+          'cooldown_after_slippage_min' not in target dict"
+     because the key is not (yet) registered in config_center's
+     target dict. The function therefore silently fell back to the
+     hardcoded default (5 min) — functionally correct, but the
+     operator lost the ability to tune the cooldown from .env.
+
+     Fix: _set_post_flatten_cooldown() now reads the value with this
+     precedence chain:
+
+         1. os.environ['CC_COOLDOWN_AFTER_SLIPPAGE_MIN']  (env, direct)
+         2. os.environ['COOLDOWN_AFTER_SLIPPAGE_MIN']     (env, no prefix)
+         3. config_center GLOBAL['cooldown_after_slippage_min'] (whitelist)
+         4. hardcoded 5 (last resort)
+
+     Behaviour is unchanged when config_center eventually whitelists
+     the key (env still wins, as it does for every other override in
+     config_center). The env-first path just removes the operational
+     dead-end observed on 2026-10-05.
+
 REV 1.9.5 (2026-10-05) — SIZING BASE INCLUDES UNREALIZED PNL (H4b):
   ✅ MEDIUM (H4b): the wallet-balance base used for risk sizing is now
      `totalMarginBalance` (wallet + unrealized PnL) instead of
@@ -41,12 +208,13 @@ REV 1.8.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS (retained).
 """
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
 import uuid
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from binance.exceptions import BinanceAPIException
@@ -55,13 +223,13 @@ from core.client import (
     fetch_position_raw, get_filters, adjust_qty, adjust_price,
     invalidate_account_cache, refresh_timestamp,
     _run_with_timeout, send_telegram, logger,
-    # ── REV 1.9.3 — explicit write lock (Phase 2). ──
-    # Every explicit lock site in this file wraps a futures_create_order
-    # MARKET close, i.e. a WRITE. The legacy _requests_lock alias is
-    # no longer imported here on purpose: any missed migration site
-    # will raise a NameError at runtime rather than silently
-    # over-serialize.
-    _write_lock, VALID_SYMBOLS, _filters_ok_to_trade,
+    # ── REV 1.9.3 / 1.9.10 — explicit locks (Phase 2). ──
+    # Every explicit lock site in this file wraps either a
+    # futures_create_order (WRITE) or a read-only account/position
+    # call (READ). The legacy _requests_lock alias is no longer
+    # imported here on purpose: any missed migration site will raise
+    # a NameError at runtime rather than silently over-serialize.
+    _read_lock, _write_lock, VALID_SYMBOLS, _filters_ok_to_trade,
     handle_order_filter_error,
 )
 from core.state import (
@@ -85,7 +253,6 @@ try:
 except Exception:
     _CT_STRATS = frozenset()
 
-
 # ═════════════════════════════════════════════════════════════
 #  REV 1.8.1 — SAFE CC NUMERIC READ
 # ═════════════════════════════════════════════════════════════
@@ -93,18 +260,51 @@ def _cc_get_num(key: str, default):
     v = _cc_get(key, None)
     return default if v is None else v
 
-
 # ═════════════════════════════════════════════════════════════
 #  REV 1.9.0 — IDEMPOTENCY + AMBIGUITY RESOLUTION
+#  REV 1.9.7 — BINANCE 36-CHAR CID LIMIT
 # ═════════════════════════════════════════════════════════════
 def _client_order_id(symbol: str, tag: str) -> str:
     """
     Deterministic per-attempt client order id. A RETRY with a new tag
     is a NEW order; an AMBIGUOUS OUTCOME is resolved by re-querying
     the SAME id.
-    """
-    return f"tb_{tag}_{symbol}_{uuid.uuid4().hex[:16]}"
 
+    REV 1.9.7 (2026-10-05) — BINANCE 36-CHAR CID LIMIT:
+      Binance rejects any newClientOrderId longer than 36 characters
+      with -4015. The old format was:
+          tb_{tag}_{symbol}_{uuid16}
+      For 12-char symbols (1000SHIBUSDT, 1000BONKUSDT, 1000FLOKIUSDT,
+      1000PEPEUSDT, PUMPBTCUSDT, etc.) plus a 9-char tag ("entry"),
+      this produced 38 chars — every market entry on those coins was
+      rejected with -4015.
+
+      Observed live: 1000SHIB market entry REJECTED at 18:09:15 on
+      2026-10-05 with cid
+          tb_entry_1000SHIBUSDT_cae7b6becb104b48  (38 chars)
+
+      Fix — two parts:
+        1. Strip the trailing 'USDT' suffix from the symbol portion.
+           The Binance API always pairs the cid with a `symbol=` param
+           on lookup, so the suffix was redundant. 1000SHIBUSDT → 1000SHIB.
+        2. Reduce uuid hex from 16 → 14 chars. Still 2^56 entropy per
+           attempt — astronomically collision-free for the lifetimes
+           involved (a single bot's order history).
+
+      New worst-case length:
+          tb_entry_1000SHIB_<14hex>   = 9 + 8 + 1 + 14 = 32 chars
+          tb_entry_1000FLOKI_<14hex>  = 9 + 9 + 1 + 14 = 33 chars
+          tb_entry_PUMPBTC_<14hex>    = 9 + 7 + 1 + 14 = 31 chars
+      All safely under the 36-char ceiling.
+
+      Backward compatibility: this function is ONLY called from the
+      market-entry path. Existing SL/TP orders use their own inline
+      format with 12-char uuid (max 32 chars, already compliant) and
+      are NOT affected. No in-flight order lookup depends on the
+      previous format.
+    """
+    short = symbol[:-4] if symbol.endswith('USDT') else symbol
+    return f"tb_{tag}_{short}_{uuid.uuid4().hex[:14]}"
 
 def _resolve_ambiguous_market(client, pair: str, cid: str,
                               timeout_s: float = 8.0):
@@ -143,9 +343,80 @@ def _resolve_ambiguous_market(client, pair: str, cid: str,
         time.sleep(0.4)
     return last_status, 0.0, 0.0
 
+# ═════════════════════════════════════════════════════════════
+#  REV 1.9.6 (G2 / G2b) — POST-FLATTEN COOLDOWN
+# ═════════════════════════════════════════════════════════════
+def _set_post_flatten_cooldown(symbol: str, reason: str = "flatten") -> None:
+    """
+    REV 1.9.6 (G2) — set a per-symbol cooldown after a defensive
+    flatten.
+
+    Prevents the churn loop where the strategy re-emits the same
+    still-active signal on the next scan and immediately re-enters
+    the same losing trade. Uses the existing `cooldown_until` dict
+    (guarded by `COOLDOWN_LOCK`) which the entry guard at the top of
+    place_order_fixed already honours — so no new state, no new
+    locks, no race.
+
+    REV 1.9.6 (G2b) — ENV-FIRST COOLDOWN READ:
+      Config_center's env-override layer only accepts keys that are
+      already registered in its target dict. This new key isn't, so
+      a "⚠️ env override IGNORED ... key ... not in target dict"
+      warning was emitted on startup and the .env value had no
+      effect (the code silently fell back to the default 5 min).
+
+      Fix: read the value in this precedence order:
+        1. os.environ['CC_COOLDOWN_AFTER_SLIPPAGE_MIN']   (direct)
+        2. os.environ['COOLDOWN_AFTER_SLIPPAGE_MIN']      (no prefix)
+        3. config_center GLOBAL['cooldown_after_slippage_min']
+        4. hardcoded default 5
+
+      Set the cooldown to 0 to disable.
+
+    This function is intentionally FAIL-OPEN: if anything goes
+    wrong while setting the cooldown (config lookup, clock issue),
+    the entry is not blocked — we only lose the churn protection.
+    A missed cooldown is annoying; a missed entry is a bug.
+    """
+    try:
+        # ── REV 1.9.6 (G2b) — env-first read ──
+        _cd_min = None
+        for _env_key in (
+            "CC_COOLDOWN_AFTER_SLIPPAGE_MIN",
+            "COOLDOWN_AFTER_SLIPPAGE_MIN",
+        ):
+            _env_val = os.environ.get(_env_key)
+            if _env_val is not None and str(_env_val).strip() != "":
+                try:
+                    _cd_min = float(_env_val)
+                    break
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[{symbol}] invalid {_env_key}="
+                        f"{_env_val!r} — falling through to next source"
+                    )
+                    continue
+
+        # ── Fall back to config_center, then hardcoded default ──
+        if _cd_min is None:
+            _cd_min = float(_cc_get_num("cooldown_after_slippage_min", 5))
+
+        if _cd_min <= 0:
+            return
+
+        _until = datetime.now(PKT) + timedelta(minutes=_cd_min)
+        with COOLDOWN_LOCK:
+            cooldown_until[symbol] = _until
+        logger.warning(
+            f"[{symbol}] {_cd_min:.1f}m cooldown set after {reason} "
+            f"(until {_until.strftime('%H:%M:%S')}) — prevents churn"
+        )
+    except Exception as e:
+        logger.debug(f"[{symbol}] cooldown set failed ({reason}): {e}")
 
 # ═════════════════════════════════════════════════════════════
 #  REV 1.9.0 — RISK SIZING WITH FLOOR GUARD
+#  REV 1.9.10 — FLOOR CEILS TO STEP (min_notional must be honored)
 # ═════════════════════════════════════════════════════════════
 def _risk_size_with_floor_guard(
     wallet_balance: float,
@@ -166,6 +437,13 @@ def _risk_size_with_floor_guard(
     NEVER bumps qty up to satisfy exchange minimums. A skipped trade
     costs nothing; an oversized trade in a flash crash costs the
     account.
+
+    REV 1.9.10 — FLOOR CEIL:
+      `floor_qty` previously floored to step, which could UNDERSHOOT
+      min_notional (e.g. step=0.1, price=33, min_notional=5 → old
+      floor_qty = 0.1 → notional $3.30 < $5 → downstream abort).
+      Now we ceil to the next step so the floor GUARANTEES
+      notional ≥ min_notional.
     """
     try:
         wb = Decimal(str(wallet_balance))
@@ -189,11 +467,16 @@ def _risk_size_with_floor_guard(
         return None
 
     if max_qty is not None and qty > max_qty:
+        # NOTE: cap path FLOORS — must never exceed exchange maxQty.
         qty = (max_qty // step) * step
 
     # Floor: max of minQty and minNotional/price, step-aligned.
     floor_qty = max(min_qty, Decimal(str(min_notional)) / rpx)
-    floor_qty = (floor_qty // step) * step
+    # ✅ REV 1.9.10 FIX: CEIL to next step — floor must GUARANTEE
+    # notional >= min_notional, not undershoot it.
+    _rem = floor_qty % step
+    if _rem > 0:
+        floor_qty = floor_qty - _rem + step
     if floor_qty <= 0:
         return None
 
@@ -223,7 +506,6 @@ def _risk_size_with_floor_guard(
         return None
     return qty
 
-
 # ═════════════════════════════════════════════════════════════
 #  SIZING SCALERS (unchanged logic; live config reads)
 # ═════════════════════════════════════════════════════════════
@@ -251,7 +533,6 @@ def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal,
     except Exception as e:
         logger.debug(f"[{symbol}] vol sizing failed: {e}")
         return qty_dec
-
 
 def _apply_counter_trend_sizing(symbol: str, strategy: str,
                                 qty_dec: Decimal, step: Decimal,
@@ -286,7 +567,6 @@ def _apply_counter_trend_sizing(symbol: str, strategy: str,
         logger.debug(f"[{symbol}] counter-trend scaling failed: {e}")
         return qty_dec
 
-
 def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
     _regime_now = 'UNKNOWN'
     _hold_min = int(_cc_get_num('hold_minutes', 180))
@@ -308,7 +588,6 @@ def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
         logger.debug(f"[{symbol}] regime snapshot failed: {_re}")
     return _regime_now, _hold_min
 
-
 def _get_regime_now(symbol: str) -> str:
     try:
         from market.indicators import get_cached_indicator
@@ -319,10 +598,10 @@ def _get_regime_now(symbol: str) -> str:
         pass
     return 'UNKNOWN'
 
-
 # ═════════════════════════════════════════════════════════════
 #  MARKET ORDER PLACEMENT WITH IDEMPOTENCY
 #  REV 1.9.2 (C1) — no fresh cid on UNKNOWN ambiguity
+#  REV 1.9.9 — market entry now runs inside _write_lock
 # ═════════════════════════════════════════════════════════════
 def _place_market_idempotent(client, pair: str, side: str, qty_str: str,
                              cid: str, max_attempts: int = 2):
@@ -340,14 +619,25 @@ def _place_market_idempotent(client, pair: str, side: str, qty_str: str,
       Retrying with a fresh cid on UNKNOWN would risk placing a
       SECOND MARKET order if the first one actually landed but its
       ack was lost — doubling the position.
+
+    REV 1.9.9 — WRITE-LOCK:
+      The `_place` inner function now acquires `_write_lock` before
+      calling `client.futures_create_order`. It runs inside a
+      worker thread spawned by `_run_with_timeout`, which does NOT
+      hold the lock itself (verified in core/client.py REV 11.7).
+      `_write_lock` is an RLock, so if the caller happens to hold
+      it (defensive), re-entry is safe. The lock serializes this
+      market entry against the trade manager's SL updates, which
+      use the same requests.Session.
     """
     for attempt in range(max_attempts):
         try:
             def _place():
-                return client.futures_create_order(
-                    symbol=pair, side=side, type='MARKET',
-                    quantity=qty_str, newClientOrderId=cid,
-                )
+                with _write_lock:
+                    return client.futures_create_order(
+                        symbol=pair, side=side, type='MARKET',
+                        quantity=qty_str, newClientOrderId=cid,
+                    )
             # REV 1.9.1 — 6s matches REV 11.2 executor cap.
             resp = _run_with_timeout(_place, 6, f"market:{pair}")
             if not resp:
@@ -459,7 +749,6 @@ def _place_market_idempotent(client, pair: str, side: str, qty_str: str,
     # Both attempts exhausted without a fill
     return 'UNKNOWN', 0.0, 0.0, cid
 
-
 # ═════════════════════════════════════════════════════════════
 #  MAIN ENTRY
 # ═════════════════════════════════════════════════════════════
@@ -548,8 +837,10 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             return False
 
         # Pre-check: existing position
+        # ── REV 1.9.10 — _read_lock (requests.Session not thread-safe). ──
         try:
-            pos_list = client.futures_position_information(symbol=pair)
+            with _read_lock:
+                pos_list = client.futures_position_information(symbol=pair)
             if pos_list and float(pos_list[0]['positionAmt']) != 0:
                 logger.warning(f" {symbol} already in position")
                 _release_slot()
@@ -558,8 +849,10 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             logger.warning(f"Position pre-check failed for {pair}: {e}")
 
         # Account + margin checks
+        # ── REV 1.9.10 — _read_lock. ──
         try:
-            account = client.futures_account()
+            with _read_lock:
+                account = client.futures_account()
             try:
                 from core.client import _ACCOUNT_CACHE, _ACCOUNT_CACHE_LOCK
                 with _ACCOUNT_CACHE_LOCK:
@@ -609,14 +902,17 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             return False
 
         # Margin type / leverage
+        # ── REV 1.9.10 — _write_lock (account-state mutation). ──
         try:
-            client.futures_change_margin_type(symbol=pair, marginType='ISOLATED')
+            with _write_lock:
+                client.futures_change_margin_type(symbol=pair, marginType='ISOLATED')
         except Exception as e:
             if '-4046' not in str(e) and 'No need to change margin type' not in str(e):
                 logger.debug(f"Margin type warning: {e}")
 
         try:
-            client.futures_change_leverage(symbol=pair, leverage=_leverage)
+            with _write_lock:
+                client.futures_change_leverage(symbol=pair, leverage=_leverage)
         except Exception as e:
             logger.error(f"Leverage change FAILED for {pair}: {e}")
             _release_slot()
@@ -720,6 +1016,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         qty_dec = _apply_vol_class_sizing(symbol, qty_dec, step, min_qty)
 
         # Cap by maxQty (still aborts if cap < minQty)
+        # NOTE: this path intentionally FLOORS (rounds down) — the cap
+        # must never exceed the exchange ceiling.
         if max_qty is not None and qty_dec > max_qty:
             logger.warning(
                 f"[{symbol}] qty {qty_dec} > exchange maxQty {max_qty} — capping"
@@ -738,6 +1036,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         notional = float(qty_dec) * entry_price_est
 
         # min_notional bump (with 1.5× guard preserved)
+        # ── REV 1.9.10 — CEIL to step so notional GUARANTEES ≥ min. ──
         if notional < min_notional:
             _pre_bump_qty = qty_dec
             _bump_mult = float(_cc_get_num("min_notional_bump_mult", 1.02))
@@ -745,7 +1044,10 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 f"Notional {notional:.2f} < min {min_notional}, increasing qty"
             )
             qty_dec = Decimal(str(min_notional / entry_price_est * _bump_mult))
-            qty_dec = (qty_dec // step) * step
+            # ✅ REV 1.9.10 FIX: ceil to next step (was floor — undershot).
+            _rem = qty_dec % step
+            if _rem > 0:
+                qty_dec = qty_dec - _rem + step
             if qty_dec < min_qty:
                 qty_dec = min_qty
             if max_qty is not None and qty_dec > max_qty:
@@ -793,6 +1095,63 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         qty_tp1 = format(qty_tp1_dec, f'.{prec}f')
         qty_tp2 = format(qty_tp2_dec, f'.{prec}f') if qty_tp2_dec > 0 else '0'
         sl_price = final_sl_price
+
+        # ═══════════════════════════════════════════════════════════
+        #  REV 1.9.8 — PRE-ENTRY RR GUARD (RR_COLLAPSE FIX)
+        #
+        #  Predict what the post-cap RR will be BEFORE sending the
+        #  market order. If the coin's TP cap + the signal's SL
+        #  distance make min_rr mathematically impossible, SKIP
+        #  the trade rather than entering and immediately flattening
+        #  on the post-fill RR_COLLAPSE check.
+        #
+        #  Root cause (TRUMP/DOT/RENDER, 2026-10-06/07):
+        #    Signal engine emits wide ATR-based SL (e.g. 8.9% on
+        #    TRUMP), but the coin's TP1 cap (coins_config.get_caps)
+        #    is tighter (e.g. 9.7%). Post-cap RR = 9.7/8.9 = 1.09
+        #    < min_rr=1.50 → RR_COLLAPSE close. Guard detects the
+        #    impossibility pre-entry → no order ever sent.
+        #
+        #  Fail-open: on any internal error, log and proceed — a
+        #  missed guard is preferable to a skipped valid trade.
+        #  The downstream RR_COLLAPSE check remains as defence-in-
+        #  depth for realised-slippage edge cases.
+        # ═══════════════════════════════════════════════════════════
+        try:
+            _caps_pre = get_caps(symbol)
+            _ref_for_rr = _ref_price if _ref_price > 0 else entry_price_est
+            _risk_pre = abs(_ref_for_rr - float(final_sl_price))
+            if _risk_pre > 0 and _ref_for_rr > 0:
+                _tp1_pre = float(tp1_price)
+                if side == 'BUY':
+                    _tp1_pre_capped = min(
+                        _tp1_pre, _ref_for_rr * (1 + _caps_pre["tp1"])
+                    )
+                else:
+                    _tp1_pre_capped = max(
+                        _tp1_pre, _ref_for_rr * (1 - _caps_pre["tp1"])
+                    )
+                _reward_pre = abs(_tp1_pre_capped - _ref_for_rr)
+                _pred_rr = _reward_pre / _risk_pre
+                _min_rr_pre = _get_min_rr_central(strategy)
+                _tol_pre = float(_cc_get_num("rr_collapse_tol", 0.02))
+                if _pred_rr < _min_rr_pre - _tol_pre:
+                    logger.info(
+                        f"[{symbol}] ⏭️  PRE-ENTRY RR SKIP: predicted "
+                        f"{_pred_rr:.3f} < min {_min_rr_pre:.2f} "
+                        f"(tol {_tol_pre:.2f}) — "
+                        f"SL dist {_risk_pre / _ref_for_rr * 100:.2f}%, "
+                        f"TP cap {_caps_pre['tp1'] * 100:.2f}% "
+                        f"[strategy={strategy}]"
+                    )
+                    _release_slot()
+                    return False
+        except Exception as _pre_e:
+            logger.warning(
+                f"[{symbol}] pre-entry RR guard error: "
+                f"{type(_pre_e).__name__}: {_pre_e} — proceeding"
+            )
+        # ═══════════════════════════════════════════════════════════
 
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         _regime_now, _hold_min = _snapshot_regime(symbol, strategy)
@@ -980,16 +1339,59 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 f"fill={entry_price:.6f} adverse_vs_signal={_drift_sig:+.3f}% "
                 f"adverse_vs_est={_drift_est:+.3f}%"
             )
-            # REV 1.9.0 — adverse slippage abort
+
+            # ═══════════════════════════════════════════════════════
+            #  REV 1.9.6 (G1) — STALE-SIGNAL SLIPPAGE GUARD
+            #
+            #  The signal→est gap was ALREADY validated by the SIGNAL
+            #  DRIFT REJECT gate at the top of place_order_fixed.
+            #  Comparing the fill against the original signal price
+            #  therefore double-counts that pre-entry drift. When the
+            #  signal is stale (gap ≥ 50% of slip threshold), fall
+            #  back to drift-vs-est — the correct measure of execution
+            #  slippage.
+            #
+            #  Concrete failure this prevents (CRV, 2026-10-05):
+            #    signal=0.380200  est=0.381700  fill=0.382200
+            #    adverse_vs_signal = +0.526%  > 0.500% → OLD: flatten
+            #    adverse_vs_est    = +0.131%  << 0.500%   (fine)
+            #  The signal→est gap (0.394%) was already pre-validated;
+            #  the fill was only 0.13% worse than expected. Old code
+            #  flattened anyway, and the strategy immediately re-
+            #  emitted the same signal → churn loop → balance drain.
+            # ═══════════════════════════════════════════════════════
             _slip_max = float(_cc_get_num("max_fill_slippage_pct", 0.50))
-            if _drift_sig > _slip_max:
+            _sig_est_gap = (
+                abs(entry_price_est - _ref_price) / _ref_price * 100.0
+                if _ref_price > 0 else 0.0
+            )
+            _use_est_check = _sig_est_gap > (_slip_max * 0.5)
+
+            if _use_est_check:
+                _effective_drift = _drift_est
+                _effective_label = "vs_est(stale_sig)"
+                logger.info(
+                    f"[{symbol}] signal→est gap {_sig_est_gap:.3f}% "
+                    f"≥ {_slip_max * 0.5:.3f}% — signal treated as STALE, "
+                    f"using drift-vs-est for slippage check "
+                    f"(drift={_effective_drift:+.3f}%)"
+                )
+            else:
+                _effective_drift = _drift_sig
+                _effective_label = "vs_signal"
+
+            if _effective_drift > _slip_max:
                 logger.critical(
-                    f"[{symbol}] ADVERSE SLIPPAGE {_drift_sig:.3f}% > "
-                    f"{_slip_max:.3f}% — flattening position"
+                    f"[{symbol}] ADVERSE SLIPPAGE "
+                    f"{_effective_drift:.3f}% ({_effective_label}) > "
+                    f"{_slip_max:.3f}% — flattening position "
+                    f"[sig={_ref_price:.6f} est={entry_price_est:.6f} "
+                    f"fill={entry_price:.6f}]"
                 )
                 try:
                     send_telegram(
-                        f"🚨 {symbol} adverse slippage {_drift_sig:.2f}% "
+                        f"🚨 {symbol} adverse slippage "
+                        f"{_effective_drift:.2f}% ({_effective_label}) "
                         f"— flattening"
                     )
                 except Exception:
@@ -1009,6 +1411,17 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                         daemon=True,
                     ).start()
                 _release_slot()
+                # ═══════════════════════════════════════════════════
+                #  REV 1.9.6 (G2) — post-flatten cooldown
+                #
+                #  Without this, the next scan (~15-30s later) re-emits
+                #  the same still-active signal and the bot re-enters
+                #  the same churning trade. Cooldown is DEFENCE-IN-DEPTH
+                #  on top of G1: even if G1's heuristic misses a future
+                #  symbol, no more than one slippage-flatten per symbol
+                #  per cooldown window.
+                # ═══════════════════════════════════════════════════
+                _set_post_flatten_cooldown(symbol, reason="slippage_flatten")
                 return False
         except Exception as _te:
             logger.debug(f"[{symbol}] telemetry failed: {_te}")
@@ -1118,6 +1531,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         #  IMMEDIATE PROTECTIVE STOP — placed ASAP after fill
         #  REV 1.9.1 — on filter cache-bust, recompute sl_adj with
         #  fresh tickSize. Previously only qty_str was re-rounded.
+        #  REV 1.9.9 — wrapped in _write_lock.
         # ═══════════════════════════════════════════════════════════
         sl_adj = adjust_price(sl_price, f['tickSize'])
         sl_placed = False
@@ -1125,13 +1539,14 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         for attempt in range(3):
             try:
                 def _place_sl():
-                    return client.futures_create_order(
-                        symbol=pair, side=close_side, type='STOP_MARKET',
-                        stopPrice=sl_adj, quantity=qty_str,
-                        reduceOnly=True, timeInForce='GTC',
-                        workingType='MARK_PRICE',
-                        newClientOrderId=f"tb_sl_{pair}_{uuid.uuid4().hex[:12]}",
-                    )
+                    with _write_lock:
+                        return client.futures_create_order(
+                            symbol=pair, side=close_side, type='STOP_MARKET',
+                            stopPrice=sl_adj, quantity=qty_str,
+                            reduceOnly=True, timeInForce='GTC',
+                            workingType='MARK_PRICE',
+                            newClientOrderId=f"tb_sl_{pair}_{uuid.uuid4().hex[:12]}",
+                        )
                 sl_resp = _run_with_timeout(_place_sl, 5, f"sl:{pair}")
                 sl_id = sl_resp.get('orderId') or sl_resp.get('algoId')
                 logger.info(f" SL placed at {sl_adj} (ID: {sl_id})")
@@ -1503,6 +1918,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         # ═══════════════════════════════════════════════════════════
         #  PLACE TP1 / TP2
         #  REV 1.9.1 — recompute *_adj on filter cache-bust.
+        #  REV 1.9.9 — both wrapped in _write_lock.
         # ═══════════════════════════════════════════════════════════
         tp1_adj = adjust_price(tp1_price, f['tickSize'])
         tp2_adj = adjust_price(tp2_price, f['tickSize'])
@@ -1512,13 +1928,14 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         for tp1_attempt in range(2):
             try:
                 def _place_tp1():
-                    return client.futures_create_order(
-                        symbol=pair, side=close_side, type='TAKE_PROFIT_MARKET',
-                        stopPrice=tp1_adj, quantity=qty_tp1,
-                        reduceOnly=True, timeInForce='GTC',
-                        workingType='MARK_PRICE',
-                        newClientOrderId=f"tb_tp1_{pair}_{uuid.uuid4().hex[:12]}",
-                    )
+                    with _write_lock:
+                        return client.futures_create_order(
+                            symbol=pair, side=close_side, type='TAKE_PROFIT_MARKET',
+                            stopPrice=tp1_adj, quantity=qty_tp1,
+                            reduceOnly=True, timeInForce='GTC',
+                            workingType='MARK_PRICE',
+                            newClientOrderId=f"tb_tp1_{pair}_{uuid.uuid4().hex[:12]}",
+                        )
                 tp1_resp = _run_with_timeout(_place_tp1, 5, f"tp1:{pair}")
                 tp1_id = tp1_resp.get('orderId') or tp1_resp.get('algoId')
                 logger.info(f" TP1 at {tp1_adj} Qty {qty_tp1} (ID: {tp1_id})")
@@ -1548,14 +1965,15 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             for tp2_attempt in range(2):
                 try:
                     def _place_tp2():
-                        return client.futures_create_order(
-                            symbol=pair, side=close_side,
-                            type='TAKE_PROFIT_MARKET',
-                            stopPrice=tp2_adj, quantity=qty_tp2,
-                            reduceOnly=True, timeInForce='GTC',
-                            workingType='MARK_PRICE',
-                            newClientOrderId=f"tb_tp2_{pair}_{uuid.uuid4().hex[:12]}",
-                        )
+                        with _write_lock:
+                            return client.futures_create_order(
+                                symbol=pair, side=close_side,
+                                type='TAKE_PROFIT_MARKET',
+                                stopPrice=tp2_adj, quantity=qty_tp2,
+                                reduceOnly=True, timeInForce='GTC',
+                                workingType='MARK_PRICE',
+                                newClientOrderId=f"tb_tp2_{pair}_{uuid.uuid4().hex[:12]}",
+                            )
                     tp2_resp = _run_with_timeout(_place_tp2, 5, f"tp2:{pair}")
                     tp2_id = tp2_resp.get('orderId') or tp2_resp.get('algoId')
                     logger.info(f" TP2 at {tp2_adj} Qty {qty_tp2} (ID: {tp2_id})")

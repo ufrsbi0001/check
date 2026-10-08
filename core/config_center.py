@@ -1,6 +1,25 @@
 """
 core/config_center.py — SINGLE SOURCE OF TRUTH for ALL trading config.
 
+REV 6.2 (2026-10-05) — POST-FLATTEN COOLDOWN KEY REGISTERED:
+  ✅ Added `cooldown_after_slippage_min` (default 5). Consumed by
+     orders/entry.py::_set_post_flatten_cooldown() to prevent the
+     CRV/NEAR/DOT churn loop observed on 2026-10-05. Previously
+     .env supplied CC_COOLDOWN_AFTER_SLIPPAGE_MIN but the key was
+     not present in GLOBAL, so config_center rejected the override
+     with the "key not in target dict" warning AND the entry.py
+     reader silently fell back to the hardcoded default (5 min).
+     entry.py has since been hardened to read the env var directly
+     (see REV 1.9.6 G2b), but registering the key here restores
+     the normal config_center flow — env override accepted, value
+     visible in /diagnostic, validated for bounds, and tunable at
+     runtime via update_runtime() (non-safety key).
+  ✅ Bounds: [0, 1440] minutes (0 disables the cooldown; 1440 = 1
+     day is a hard sanity ceiling).
+  ✅ _LEGACY_ENV_MAP extended so a bare COOLDOWN_AFTER_SLIPPAGE_MIN
+     (without the CC_ prefix) also works.
+  ✅ Diagnostic print list extended to surface the new key.
+
 REV 6.1 (2026-10-04) — RSI DIVERGENCE + FVG RETEST FILTERS:
   ✅ Added `use_rsi_divergence` (default True). Gates the
      _filter_rsi_divergence() vote in signals/decision_engine.py.
@@ -87,21 +106,21 @@ VOL_CLASS_QTY_MULT: dict[str, float] = {
 # ═══════════════════════════════════════════════════════════════
 VOL_CLASS_R_THRESHOLDS: dict[str, dict[str, float]] = {
     "HIGH": {
-        "be_r": 0.80, "be_stop_r": 0.20,
-        "lock1_r": 1.20, "lock1_stop_r": 0.55,
-        "lock2_r": 1.80, "lock2_stop_r": 0.95,
+        "be_r": 0.80, "be_stop_r": 0.30,       # 0.8R par BE, thora room de ke
+        "lock1_r": 1.50, "lock1_stop_r": 0.70,  # 1.5R par SL move, profit lock
+        "lock2_r": 2.00, "lock2_stop_r": 1.20,  # 2.0R par SL move, heavy lock
         "max_hold_bars": 26,
     },
     "MED": {
-        "be_r": 0.75, "be_stop_r": 0.15,
-        "lock1_r": 1.10, "lock1_stop_r": 0.55,
+        "be_r": 0.70, "be_stop_r": 0.25,
+        "lock1_r": 1.20, "lock1_stop_r": 0.50,
         "lock2_r": 1.70, "lock2_stop_r": 0.90,
         "max_hold_bars": 28,
     },
     "LOW": {
-        "be_r": 0.70, "be_stop_r": 0.15,
-        "lock1_r": 1.00, "lock1_stop_r": 0.50,
-        "lock2_r": 1.60, "lock2_stop_r": 0.85,
+        "be_r": 0.60, "be_stop_r": 0.20,
+        "lock1_r": 1.00, "lock1_stop_r": 0.40,
+        "lock2_r": 1.50, "lock2_stop_r": 0.80,
         "max_hold_bars": 30,
     },
 }
@@ -176,6 +195,15 @@ GLOBAL: dict = {
     "cooldown_after_sl_min":      20,
     "cooldown_after_tp_min":      15,
     "partial_close_usdt":         15.0,
+
+    # ── REV 6.2 — post-flatten cooldown (orders/entry.py G2) ──
+    # After a defensive slippage-flatten, block re-entry on the same
+    # symbol for this many minutes. Prevents the CRV/NEAR/DOT churn
+    # loop where the strategy re-emits the same stale signal on the
+    # next scan and immediately re-enters the same losing trade.
+    # 0 = disabled. Bounds: [0, 1440]. Env: CC_COOLDOWN_AFTER_SLIPPAGE_MIN
+    # or legacy COOLDOWN_AFTER_SLIPPAGE_MIN.
+    "cooldown_after_slippage_min": 5,
 
     # ── Signal filters ──
     "min_adx":                    22,
@@ -687,6 +715,9 @@ _LEGACY_ENV_MAP: dict[str, str] = {
     "hold_minutes":                "MAX_HOLD_MINUTES",
     "cooldown_after_sl_min":       "COOLDOWN_AFTER_SL_MIN",
     "cooldown_after_tp_min":       "COOLDOWN_AFTER_TP_MIN",
+    # REV 6.2 — post-flatten cooldown. Allows the bare (non-CC_) env
+    # name to work too. The CC_ form is auto-discovered by Pass 1.
+    "cooldown_after_slippage_min": "COOLDOWN_AFTER_SLIPPAGE_MIN",
     "partial_close_usdt":          "PARTIAL_CLOSE_USDT",
     "min_confidence":              "MIN_CONFIDENCE",
     "min_adx":                     "MIN_ADX",
@@ -821,6 +852,17 @@ def _validate() -> None:
         errors.append("cooldown_after_sl_min must be ≥0")
     if g["cooldown_after_tp_min"] < 0:
         errors.append("cooldown_after_tp_min must be ≥0")
+
+    # REV 6.2 — post-flatten cooldown bounds.
+    # 0 = disable. 1440 = 24h hard sanity ceiling; anything longer is
+    # almost certainly a typo, and would silently block a symbol for
+    # the whole day.
+    if not 0 <= g["cooldown_after_slippage_min"] <= 1440:
+        errors.append(
+            f"cooldown_after_slippage_min={g['cooldown_after_slippage_min']} "
+            f"— must be in [0, 1440]"
+        )
+
     if g["partial_close_usdt"] < 0:
         errors.append("partial_close_usdt must be ≥0 (0 = disabled)")
     if not 0 <= g["min_confidence"] <= 100:
@@ -974,7 +1016,7 @@ if __name__ == "__main__":
     _canon = sys.modules.get("core.config_center", sys.modules[__name__])
 
     print("=" * 70)
-    print("  CONFIG CENTER DIAGNOSTIC — REV 6.1 (RSI div + FVG retest)")
+    print("  CONFIG CENTER DIAGNOSTIC — REV 6.2 (post-flatten cooldown)")
     print("=" * 70)
 
     _missing = _canon.verify_proxy_contract()
@@ -1011,6 +1053,12 @@ if __name__ == "__main__":
         "max_spread_trend", "max_spread_range", "max_spread_volatility",
     ):
         print(f"    {k:<32} = {_canon.GLOBAL[k]}")
+
+    # ── REV 6.2 — Post-flatten cooldown ──
+    print()
+    print("  REV 6.2 — Post-flatten cooldown (orders/entry.py G2):")
+    print(f"    cooldown_after_slippage_min     = "
+          f"{_canon.GLOBAL['cooldown_after_slippage_min']}")
 
     # ── REV 6.0 — Liquidity Sweep / FVG / VWAP Reversion ──
     print()
